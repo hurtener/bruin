@@ -125,7 +125,7 @@ func TestOpenReadBindsArgumentsAndExposesEmptySchema(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	mock.ExpectBegin()
 	mock.ExpectExec("SET @bruin_read_attempt = ?").WithArgs("attempt-1").WillReturnResult(sqlmock.NewResult(0, 0))
-	mock.ExpectQuery("SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), '')").WillReturnRows(sqlmock.NewRows([]string{"id", "account", "database"}).AddRow(42, "reader@%", "warehouse"))
+	mock.ExpectQuery("SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), ''), @@server_uuid").WillReturnRows(sqlmock.NewRows([]string{"id", "account", "database", "server_uuid"}).AddRow(42, "reader@%", "warehouse", "server-uuid"))
 	mock.ExpectQuery("SELECT amount, payload FROM facts WHERE id = ?").WithArgs(int64(7)).WillReturnRows(sqlmock.NewRowsWithColumnDefinition(
 		sqlmock.NewColumn("amount").OfType("DECIMAL", []byte{}).WithPrecisionAndScale(38, 9),
 		sqlmock.NewColumn("payload").OfType("BLOB", []byte{}),
@@ -166,4 +166,16 @@ func TestGovernedReadDSNDisablesMultiStatementsAndInterpolation(t *testing.T) {
 	require.False(t, parsed.MultiStatements)
 	require.False(t, parsed.InterpolateParams)
 	require.Equal(t, "true", parsed.TLSConfig)
+}
+
+func TestCancelReadRejectsChangedServerIncarnation(t *testing.T) {
+	t.Parallel()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	mock.ExpectQuery("SELECT @@server_uuid").WillReturnRows(sqlmock.NewRows([]string{"server_uuid"}).AddRow("new-server"))
+	client := &Client{readConn: sqlx.NewDb(db, "sqlmock"), control: sqlx.NewDb(db, "sqlmock")}
+	err = client.CancelRead(t.Context(), ReadIdentity{ConnectionID: 42, AttemptTag: "attempt-1", Account: "reader@%", Database: "warehouse", ServerUUID: "old-server"}, ReadOptions{})
+	require.ErrorIs(t, err, ErrReadNotActive)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

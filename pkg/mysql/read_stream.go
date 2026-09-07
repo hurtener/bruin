@@ -34,10 +34,11 @@ type ReadIdentity struct {
 	AttemptTag   string
 	Account      string
 	Database     string
+	ServerUUID   string
 }
 
 func (i ReadIdentity) valid() bool {
-	return i.ConnectionID != 0 && readTagPattern.MatchString(i.AttemptTag) && i.Account != ""
+	return i.ConnectionID != 0 && readTagPattern.MatchString(i.AttemptTag) && i.Account != "" && readTagPattern.MatchString(i.ServerUUID)
 }
 
 // ReadObserver journals dispatch before user SQL and acknowledges only after
@@ -70,8 +71,24 @@ func (c *Client) ReadStatus(ctx context.Context, identity ReadIdentity, options 
 	if err := c.initializeReadDB(ctx, options.RequireTLS); err != nil {
 		return "", err
 	}
+	control, err := c.control.Connx(ctx)
+	if err != nil {
+		return ReadStateIndeterminate, fmt.Errorf("failed to reserve mysql control connection: %w", err)
+	}
+	defer control.Close()
+	return readStatusOn(ctx, control, identity)
+}
+
+func readStatusOn(ctx context.Context, control *sqlx.Conn, identity ReadIdentity) (ReadState, error) {
+	var serverUUID string
+	if err := control.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&serverUUID); err != nil || serverUUID != identity.ServerUUID {
+		if err == nil {
+			err = errors.New("mysql server incarnation changed")
+		}
+		return ReadStateIndeterminate, err
+	}
 	var count, running int
-	err := c.control.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(t.PROCESSLIST_COMMAND <> 'Sleep'), 0) FROM performance_schema.threads t JOIN performance_schema.user_variables_by_thread v ON v.THREAD_ID=t.THREAD_ID WHERE t.PROCESSLIST_ID=? AND t.PROCESSLIST_USER=SUBSTRING_INDEX(?, '@', 1) AND COALESCE(t.PROCESSLIST_DB, '')=? AND v.VARIABLE_NAME='bruin_read_attempt' AND CAST(v.VARIABLE_VALUE AS CHAR)=?`, identity.ConnectionID, identity.Account, identity.Database, identity.AttemptTag).Scan(&count, &running)
+	err := control.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(t.PROCESSLIST_COMMAND <> 'Sleep'), 0) FROM performance_schema.threads t JOIN performance_schema.user_variables_by_thread v ON v.THREAD_ID=t.THREAD_ID WHERE t.PROCESSLIST_ID=? AND t.PROCESSLIST_USER=SUBSTRING_INDEX(?, '@', 1) AND COALESCE(t.PROCESSLIST_DB, '')=? AND v.VARIABLE_NAME='bruin_read_attempt' AND CAST(v.VARIABLE_VALUE AS CHAR)=?`, identity.ConnectionID, identity.Account, identity.Database, identity.AttemptTag).Scan(&count, &running)
 	if err != nil {
 		return ReadStateIndeterminate, fmt.Errorf("failed to reconcile mysql read identity: %w", err)
 	}
@@ -80,11 +97,6 @@ func (c *Client) ReadStatus(ctx context.Context, identity ReadIdentity, options 
 	}
 	if running == 0 {
 		return ReadStateStopped, nil
-	}
-	c.readMutex.Lock()
-	defer c.readMutex.Unlock()
-	if active, ok := c.activeReads[identity.AttemptTag]; ok && active.identity == identity {
-		return active.state, nil
 	}
 	return ReadStateRunning, nil
 }
@@ -95,6 +107,18 @@ func (c *Client) CancelRead(ctx context.Context, identity ReadIdentity, options 
 	if !identity.valid() {
 		return ErrReadIdentity
 	}
+	if err := c.initializeReadDB(ctx, options.RequireTLS); err != nil {
+		return err
+	}
+	control, err := c.control.Connx(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to reserve mysql control connection: %w", err)
+	}
+	defer control.Close()
+	var serverUUID string
+	if err := control.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&serverUUID); err != nil || serverUUID != identity.ServerUUID {
+		return ErrReadNotActive
+	}
 	c.readMutex.Lock()
 	active, locallyOwned := c.activeReads[identity.AttemptTag]
 	if locallyOwned && active.identity == identity {
@@ -104,7 +128,7 @@ func (c *Client) CancelRead(ctx context.Context, identity ReadIdentity, options 
 	}
 	c.readMutex.Unlock()
 	if !locallyOwned {
-		state, err := c.ReadStatus(ctx, identity, options)
+		state, err := readStatusOnAfterServerProof(ctx, control, identity)
 		if err != nil {
 			return err
 		}
@@ -116,10 +140,25 @@ func (c *Client) CancelRead(ctx context.Context, identity ReadIdentity, options 
 		}
 	}
 	// KILL QUERY has no parameter marker. This value was decoded as uint64.
-	if _, err := c.control.ExecContext(ctx, fmt.Sprintf("KILL QUERY %d", identity.ConnectionID)); err != nil {
+	if _, err := control.ExecContext(ctx, fmt.Sprintf("KILL QUERY %d", identity.ConnectionID)); err != nil {
 		return fmt.Errorf("failed to cancel mysql read: %w", err)
 	}
 	return nil
+}
+
+func readStatusOnAfterServerProof(ctx context.Context, control *sqlx.Conn, identity ReadIdentity) (ReadState, error) {
+	var count, running int
+	err := control.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(t.PROCESSLIST_COMMAND <> 'Sleep'), 0) FROM performance_schema.threads t JOIN performance_schema.user_variables_by_thread v ON v.THREAD_ID=t.THREAD_ID WHERE t.PROCESSLIST_ID=? AND t.PROCESSLIST_USER=SUBSTRING_INDEX(?, '@', 1) AND COALESCE(t.PROCESSLIST_DB, '')=? AND v.VARIABLE_NAME='bruin_read_attempt' AND CAST(v.VARIABLE_VALUE AS CHAR)=?`, identity.ConnectionID, identity.Account, identity.Database, identity.AttemptTag).Scan(&count, &running)
+	if err != nil {
+		return ReadStateIndeterminate, fmt.Errorf("failed to reconcile mysql read identity: %w", err)
+	}
+	if count == 0 {
+		return ReadStateIndeterminate, nil
+	}
+	if running == 0 {
+		return ReadStateStopped, nil
+	}
+	return ReadStateRunning, nil
 }
 
 // OpenRead reserves one read-only session, publishes its identity, and only
@@ -148,7 +187,7 @@ func (c *Client) OpenRead(ctx context.Context, queryObj *query.Query, attemptTag
 		_ = tx.Rollback()
 		return fail(fmt.Errorf("failed to tag mysql read session: %w", err))
 	}
-	if err := tx.QueryRowContext(ctx, "SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), '')").Scan(&identity.ConnectionID, &identity.Account, &identity.Database); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), ''), @@server_uuid").Scan(&identity.ConnectionID, &identity.Account, &identity.Database, &identity.ServerUUID); err != nil {
 		_ = tx.Rollback()
 		return fail(fmt.Errorf("failed to identify mysql read session: %w", err))
 	}
