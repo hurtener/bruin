@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -31,9 +32,13 @@ type DB interface {
 }
 
 type Client struct {
-	conn   *sqlx.DB
-	config MySQLConfig
-	mutex  sync.Mutex
+	conn        *sqlx.DB
+	readConn    *sqlx.DB
+	control     *sqlx.DB
+	config      MySQLConfig
+	mutex       sync.Mutex
+	readMutex   sync.Mutex
+	activeReads map[string]*activeRead
 }
 
 type MySQLConfig interface {
@@ -68,6 +73,26 @@ func (c *Client) initializeDB(ctx context.Context) error {
 
 	c.conn = conn
 	return nil
+}
+
+// Close releases all legacy, governed-read, and reserved control pools.
+func (c *Client) Close() error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	var errs []error
+	seen := make(map[*sqlx.DB]struct{}, 3)
+	for _, db := range []*sqlx.DB{c.conn, c.readConn, c.control} {
+		if db == nil {
+			continue
+		}
+		if _, ok := seen[db]; ok {
+			continue
+		}
+		seen[db] = struct{}{}
+		errs = append(errs, db.Close())
+	}
+	c.conn, c.readConn, c.control = nil, nil, nil
+	return stderrors.Join(errs...)
 }
 
 func (c *Client) GetIngestrURI() (string, error) {
