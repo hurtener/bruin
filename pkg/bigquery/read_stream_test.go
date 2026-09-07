@@ -256,6 +256,20 @@ func TestGovernedDryRunProtocol(t *testing.T) {
 	}
 }
 
+func TestGovernedDryRunHonorsConnectionCap(t *testing.T) {
+	f := &readProtocolFixture{state: "DONE", dryRun: true}
+	c := readFixtureClient(t, f)
+	cap := int64(768)
+	c.config.MaxBillableBytes = &cap
+	if _, err := c.DryRunRead(context.Background(), &query.Query{Query: "SELECT amount FROM `synthetic-project.analytics.sales`"}, 1024); err != nil {
+		t.Fatal(err)
+	}
+	native := f.job["configuration"].(map[string]any)["query"].(map[string]any)
+	if native["maximumBytesBilled"] != "768" {
+		t.Fatalf("connection cap widened: %#v", native)
+	}
+}
+
 func TestReadParameterExactness(t *testing.T) {
 	for _, value := range []any{nil, uint64(1), []int{1}, time.Unix(1, 1), ReadParameter{Type: "NUMERIC", Value: "0.0000000001"}, ReadParameter{Type: "BIGNUMERIC", Value: "1e100"}, "\xff"} {
 		if _, err := readParameters([]any{value}); !errors.Is(err, ErrReadParameter) {

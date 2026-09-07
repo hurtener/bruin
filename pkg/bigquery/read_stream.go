@@ -230,6 +230,9 @@ func (c *Client) DryRunRead(ctx context.Context, q *query.Query, maxBytes int64)
 	native.DisableQueryCache = true
 	native.Location = c.config.Location
 	native.MaxBytesBilled = maxBytes
+	if c.config.MaxBillableBytes != nil && *c.config.MaxBillableBytes > 0 && *c.config.MaxBillableBytes < native.MaxBytesBilled {
+		native.MaxBytesBilled = *c.config.MaxBillableBytes
+	}
 	native.Parameters = parameters
 	job, err := native.Run(ctx)
 	if err != nil {
