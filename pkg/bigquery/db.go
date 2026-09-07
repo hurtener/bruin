@@ -82,6 +82,7 @@ func WithSoftQueryLimits(ctx context.Context) context.Context {
 }
 
 type Client struct {
+	readClosed  bool
 	client      *bigquery.Client
 	config      *Config
 	typeMapper  *diff.DatabaseTypeMapper
@@ -159,6 +160,9 @@ func (d *Client) UsesApplicationDefaultCredentials() bool {
 func (d *Client) createClient(ctx context.Context) error {
 	d.clientMutex.Lock()
 	defer d.clientMutex.Unlock()
+	if d.readClosed {
+		return ErrReadClosed
+	}
 
 	// Double-check in case another goroutine created it
 	if d.client != nil {
