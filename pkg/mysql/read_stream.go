@@ -212,18 +212,6 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 		return fail(fmt.Errorf("failed to identify mysql read session: %w", err))
 	}
 	identity.AttemptTag = attemptTag
-	maximumRows := options.MaxRows
-	if maximumRows == 0 {
-		maximumRows = 100001
-	}
-	if maximumRows < 1 || maximumRows > 100001 {
-		_ = tx.Rollback()
-		return fail(errors.New("mysql governed read row bound is invalid"))
-	}
-	if _, err := tx.ExecContext(ctx, "SET SESSION sql_select_limit = ?", maximumRows); err != nil {
-		_ = tx.Rollback()
-		return fail(fmt.Errorf("failed to set mysql result row bound: %w", err))
-	}
 	c.readMutex.Lock()
 	if c.activeReads == nil {
 		c.activeReads = make(map[string]*activeRead)
@@ -241,6 +229,20 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 			_ = tx.Rollback()
 			return fail(fmt.Errorf("mysql read verification failed: %w", err))
 		}
+	}
+	maximumRows := options.MaxRows
+	if maximumRows == 0 {
+		maximumRows = 100001
+	}
+	if maximumRows < 1 || maximumRows > 100001 {
+		c.removeActiveRead(identity)
+		_ = tx.Rollback()
+		return fail(errors.New("mysql governed read row bound is invalid"))
+	}
+	if _, err := tx.ExecContext(ctx, "SET SESSION sql_select_limit = ?", maximumRows); err != nil {
+		c.removeActiveRead(identity)
+		_ = tx.Rollback()
+		return fail(fmt.Errorf("failed to set mysql result row bound: %w", err))
 	}
 	if err := observer.OnDispatch(ctx, identity); err != nil {
 		c.removeActiveRead(identity)
