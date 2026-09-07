@@ -2084,7 +2084,7 @@ pub fn inspect_read(query: &str, dialect: DialectType, max_nodes: usize, max_dep
     let mut column_nodes = Vec::new();
     collect_wrappers(&ast, "column", &mut column_nodes);
     for column in column_nodes {
-        if read_at_column_parameter(column, dialect).is_some() {
+        if read_at_column_parameter(&column, dialect).is_some() {
             continue;
         }
         let Some(name) = identifier_name(column.get("name")) else { return json!({"error": "unsupported column reference"}); };
