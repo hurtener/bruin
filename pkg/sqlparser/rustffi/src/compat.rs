@@ -2028,12 +2028,12 @@ pub fn inspect_read(query: &str, dialect: DialectType, max_nodes: usize, max_dep
     ].into_iter().collect();
     let mut functions = BTreeSet::new();
     let mut parameter_count = 0usize;
+    let mut at_parameters = BTreeSet::new();
     for node in nodes {
         if matches!(node, Expression::Placeholder(_)) {
             parameter_count += 1;
         }
         if let Expression::Parameter(parameter) = node {
-			parameter_count += 1;
             let supported = matches!((dialect, parameter.style),
                 (DialectType::MySQL, ParameterStyle::Question)
                 | (DialectType::PostgreSQL, ParameterStyle::Dollar)
@@ -2042,8 +2042,22 @@ pub fn inspect_read(query: &str, dialect: DialectType, max_nodes: usize, max_dep
                 | (DialectType::Snowflake, ParameterStyle::Question)
                 | (DialectType::Databricks, ParameterStyle::Colon));
             if !supported { return json!({"error": "unsupported parameter style"}); }
+            if parameter.style == ParameterStyle::At {
+                let Some(name) = parameter.name.as_deref().filter(|name| valid_read_parameter_name(name)) else {
+                    return json!({"error": "unsupported parameter name"});
+                };
+                if parameter.quoted || parameter.string_quoted {
+                    return json!({"error": "unsupported quoted parameter"});
+                }
+                at_parameters.insert(name.to_string());
+            } else {
+                parameter_count += 1;
+            }
         }
         let value = expression_to_value(node);
+        if let Some(name) = value.get("column").and_then(|column| read_at_column_parameter(column, dialect)) {
+            at_parameters.insert(name.to_string());
+        }
         let kind = node_kind(&value).unwrap_or_default();
         if !allowed.contains(kind.as_str()) {
             return json!({"error": format!("unsupported read node: {kind}")});
@@ -2070,12 +2084,37 @@ pub fn inspect_read(query: &str, dialect: DialectType, max_nodes: usize, max_dep
     let mut column_nodes = Vec::new();
     collect_wrappers(&ast, "column", &mut column_nodes);
     for column in column_nodes {
+        if read_at_column_parameter(column, dialect).is_some() {
+            continue;
+        }
         let Some(name) = identifier_name(column.get("name")) else { return json!({"error": "unsupported column reference"}); };
         let table = identifier_name(column.get("table"));
         columns.insert(json!({"table": table.unwrap_or_default(), "name": name}).to_string());
     }
     let columns: Vec<Value> = columns.into_iter().filter_map(|value| serde_json::from_str(&value).ok()).collect();
-    json!({"tables": tables, "columns": columns, "outputs": outputs, "functions": functions, "parameters": parameter_count, "nodes": root.count(|_| true), "depth": root.tree_depth(), "error": ""})
+    json!({"tables": tables, "columns": columns, "outputs": outputs, "functions": functions, "parameters": parameter_count + at_parameters.len(), "nodes": root.count(|_| true), "depth": root.tree_depth(), "error": ""})
+}
+
+// polyglot-sql 0.2.0 tokenizes ordinary @name markers as unquoted columns.
+// Recognize that parsed shape only in dialects with native @ parameters; quoted
+// or qualified identifiers remain dependencies. This never rewrites query SQL.
+fn read_at_column_parameter(column: &Value, dialect: DialectType) -> Option<&str> {
+    if !matches!(dialect, DialectType::TSQL | DialectType::BigQuery)
+        || !column.get("table").is_none_or(Value::is_null) {
+        return None;
+    }
+    let identifier = column.get("name")?;
+    if identifier.get("quoted").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let name = identifier.get("name")?.as_str()?.strip_prefix('@')?;
+    valid_read_parameter_name(name).then_some(name)
+}
+
+fn valid_read_parameter_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn read_output_names(root: &Value) -> Result<Vec<String>, String> {

@@ -109,9 +109,53 @@ func TestRustSQLParserInspectReadDialects(t *testing.T) {
 			inspection, err := parser.InspectRead(test.sql, test.dialect, 128, 24)
 			require.NoError(t, err)
 			require.Equal(t, []string{test.table}, inspection.Tables)
+			require.Equal(t, 1, inspection.Parameters, "native parameter count")
+			require.Equal(t, []ReadColumn{{Name: "id"}}, inspection.Columns, "parameters are not column dependencies")
 			_, err = parser.InspectRead(test.sql+" trailing", test.dialect, 128, 24)
 			require.Error(t, err, "parser must consume the complete input")
 		})
+	}
+}
+
+func TestRustSQLParserInspectReadAtParameters(t *testing.T) {
+	parser, err := NewRustSQLParserWithConfig(false, 32768)
+	require.NoError(t, err)
+	for _, dialect := range []string{"tsql", "bigquery"} {
+		t.Run(dialect, func(t *testing.T) {
+			for _, test := range []struct {
+				predicate string
+				count     int
+			}{
+				{"id > @p1", 1},
+				{"id > @p1 AND id < @p1", 1},
+				{"id > @p2 AND id < @p1", 2},
+				{"id > @p1 AND id IN (SELECT id FROM dbo.facts WHERE id < @p1)", 1},
+				{"id = '@p1'", 0},
+			} {
+				inspection, err := parser.InspectRead("SELECT id FROM dbo.facts WHERE "+test.predicate, dialect, 128, 24)
+				require.NoError(t, err, test.predicate)
+				require.Equal(t, test.count, inspection.Parameters, test.predicate)
+				require.Equal(t, []ReadColumn{{Name: "id"}}, inspection.Columns, test.predicate)
+			}
+			for _, marker := range []string{"@@version", `@"p1"`, "@'p1'"} {
+				_, err := parser.InspectRead("SELECT id FROM dbo.facts WHERE id = "+marker, dialect, 128, 24)
+				require.Error(t, err, marker)
+			}
+		})
+	}
+	for _, test := range []struct {
+		dialect, sql string
+		column       ReadColumn
+	}{
+		{"tsql", "SELECT [@p1] AS value FROM dbo.facts", ReadColumn{Name: "@p1"}},
+		{"tsql", "SELECT f.[@p1] AS value FROM dbo.facts f", ReadColumn{Table: "f", Name: "@p1"}},
+		{"bigquery", "SELECT `@p1` AS value FROM dbo.facts", ReadColumn{Name: "@p1"}},
+		{"bigquery", "SELECT f.`@p1` AS value FROM dbo.facts f", ReadColumn{Table: "f", Name: "@p1"}},
+	} {
+		inspection, err := parser.InspectRead(test.sql, test.dialect, 128, 24)
+		require.NoError(t, err, test.sql)
+		require.Zero(t, inspection.Parameters, test.sql)
+		require.Equal(t, []ReadColumn{test.column}, inspection.Columns, test.sql)
 	}
 }
 
