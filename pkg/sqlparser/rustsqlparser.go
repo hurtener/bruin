@@ -3,6 +3,7 @@ package sqlparser
 import (
 	"encoding/json"
 	"sort"
+	"unicode"
 
 	"github.com/bruin-data/bruin/pkg/jinja"
 	"github.com/bruin-data/bruin/pkg/pipeline"
@@ -38,8 +39,18 @@ func (s *RustSQLParser) InspectRead(sql, dialect string, maxNodes, maxDepth int)
 	// Bound delimiter depth before entering native parsing. This is conservative
 	// admission only (delimiters inside literals may reject); AST traversal below
 	// remains the syntax and safety proof.
-	depth, delimiters := 0, 0
+	depth, delimiters, lexicalUnits := 0, 0, 0
 	for _, char := range sql {
+		if !unicode.IsSpace(char) {
+			lexicalUnits++
+			// The native parser recursively constructs several expression forms
+			// (including CASE and unary/operator chains) before an AST exists to
+			// measure. Keep that untrusted pre-AST work process-safe. Literals that
+			// exceed this deliberately narrow admission bound must be parameters.
+			if lexicalUnits > 512 {
+				return ReadInspection{}, errors.New("read syntax pre-parse bound exceeded")
+			}
+		}
 		switch char {
 		case '(', '[':
 			depth++

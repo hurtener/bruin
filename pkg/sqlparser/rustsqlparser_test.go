@@ -3,6 +3,8 @@
 package sqlparser
 
 import (
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -75,6 +77,21 @@ func TestRustSQLParserInspectRead(t *testing.T) {
 	}
 	_, err = parser.InspectRead("SELECT id FROM analytics.facts", "mysql", 1, 32)
 	require.Error(t, err)
+}
+
+func TestRustSQLParserInspectReadRejectsRecursiveInputBeforeNativeParser(t *testing.T) {
+	if os.Getenv("BRUIN_INSPECT_RECURSIVE_HELPER") == "1" {
+		parser, err := NewRustSQLParserWithConfig(false, 32768)
+		require.NoError(t, err)
+		statement := "SELECT " + strings.Repeat("CASE WHEN TRUE THEN ", 1000) + "1" + strings.Repeat(" ELSE 0 END", 1000)
+		_, err = parser.InspectRead(statement, "mysql", 256, 32)
+		require.Error(t, err)
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestRustSQLParserInspectReadRejectsRecursiveInputBeforeNativeParser$")
+	cmd.Env = append(os.Environ(), "BRUIN_INSPECT_RECURSIVE_HELPER=1")
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
 }
 
 func TestRustSQLParserInspectReadDialects(t *testing.T) {
