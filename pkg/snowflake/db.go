@@ -30,14 +30,28 @@ const (
 )
 
 type DB struct {
-	conn          *sqlx.DB
-	config        *Config
-	schemaCreator *ansisql.SchemaCreator
-	dsn           string
-	mutex         sync.Mutex
-	typeMapper    *diff.DatabaseTypeMapper
-	connect       func(ctx context.Context) (*sqlx.DB, error)
-	retryDelay    func(attempt int) time.Duration
+	conn           *sqlx.DB
+	config         *Config
+	schemaCreator  *ansisql.SchemaCreator
+	dsn            string
+	mutex          sync.Mutex
+	typeMapper     *diff.DatabaseTypeMapper
+	connect        func(ctx context.Context) (*sqlx.DB, error)
+	retryDelay     func(attempt int) time.Duration
+	queryIDChannel func() chan string
+}
+
+// Close drains the connection pool so credential rotation cannot reuse a
+// session opened under the prior configuration.
+func (db *DB) Close() error {
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
+	if db.conn == nil {
+		return nil
+	}
+	err := db.conn.Close()
+	db.conn = nil
+	return err
 }
 
 func NewDB(c *Config) (*DB, error) {
