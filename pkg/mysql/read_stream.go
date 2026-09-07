@@ -83,7 +83,7 @@ func readStatusOn(ctx context.Context, control *sqlx.Conn, identity ReadIdentity
 	var serverUUID string
 	if err := control.QueryRowContext(ctx, "SELECT @@server_uuid").Scan(&serverUUID); err != nil || serverUUID != identity.ServerUUID {
 		if err == nil {
-			err = errors.New("mysql server incarnation changed")
+			err = errors.New("mysql server identity changed")
 		}
 		return ReadStateIndeterminate, err
 	}

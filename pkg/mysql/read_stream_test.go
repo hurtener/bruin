@@ -168,7 +168,7 @@ func TestGovernedReadDSNDisablesMultiStatementsAndInterpolation(t *testing.T) {
 	require.Equal(t, "true", parsed.TLSConfig)
 }
 
-func TestCancelReadRejectsChangedServerIncarnation(t *testing.T) {
+func TestCancelReadRejectsChangedServerIdentity(t *testing.T) {
 	t.Parallel()
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
 	require.NoError(t, err)
