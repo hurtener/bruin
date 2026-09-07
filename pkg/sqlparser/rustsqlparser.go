@@ -14,10 +14,18 @@ type RustSQLParser struct {
 }
 
 type ReadInspection struct {
-	Tables    []string `json:"tables"`
-	Functions []string `json:"functions"`
-	Nodes     int      `json:"nodes"`
-	Depth     int      `json:"depth"`
+	Tables     []string     `json:"tables"`
+	Columns    []ReadColumn `json:"columns"`
+	Outputs    []string     `json:"outputs"`
+	Functions  []string     `json:"functions"`
+	Parameters int          `json:"parameters"`
+	Nodes      int          `json:"nodes"`
+	Depth      int          `json:"depth"`
+}
+
+type ReadColumn struct {
+	Table string `json:"table"`
+	Name  string `json:"name"`
 }
 
 // InspectRead accepts a deliberately narrow, fully traversed query-expression
@@ -26,6 +34,28 @@ type ReadInspection struct {
 func (s *RustSQLParser) InspectRead(sql, dialect string, maxNodes, maxDepth int) (ReadInspection, error) {
 	if len(sql) > s.MaxQueryLength || maxNodes < 1 || maxDepth < 1 {
 		return ReadInspection{}, errors.New("invalid read syntax bounds")
+	}
+	// Bound delimiter depth before entering native parsing. This is conservative
+	// admission only (delimiters inside literals may reject); AST traversal below
+	// remains the syntax and safety proof.
+	depth, delimiters := 0, 0
+	for _, char := range sql {
+		switch char {
+		case '(', '[':
+			depth++
+			delimiters++
+			if depth > maxDepth || delimiters > maxNodes {
+				return ReadInspection{}, errors.New("read syntax bounds exceeded")
+			}
+		case ')', ']':
+			depth--
+			if depth < 0 {
+				return ReadInspection{}, errors.New("read syntax bounds exceeded")
+			}
+		}
+	}
+	if depth != 0 {
+		return ReadInspection{}, errors.New("read syntax bounds exceeded")
 	}
 	payload, err := rustFFIInspectRead(sql, dialect, maxNodes, maxDepth)
 	if err != nil {

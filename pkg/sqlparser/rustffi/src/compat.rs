@@ -2027,8 +2027,13 @@ pub fn inspect_read(query: &str, dialect: DialectType, max_nodes: usize, max_dep
         "row_number", "rank", "dense_rank", "lag", "lead", "first_value", "last_value", "nth_value", "ntile",
     ].into_iter().collect();
     let mut functions = BTreeSet::new();
+    let mut parameter_count = 0usize;
     for node in nodes {
+        if matches!(node, Expression::Placeholder(_)) {
+            parameter_count += 1;
+        }
         if let Expression::Parameter(parameter) = node {
+			parameter_count += 1;
             let supported = matches!((dialect, parameter.style),
                 (DialectType::MySQL, ParameterStyle::Question)
                 | (DialectType::PostgreSQL, ParameterStyle::Dollar)
@@ -2060,7 +2065,47 @@ pub fn inspect_read(query: &str, dialect: DialectType, max_nodes: usize, max_dep
     let ast = expression_to_value(root);
     let mut tables: Vec<String> = collect_real_tables(&ast).iter().map(get_table_name_obj).filter(|v| !v.is_empty()).collect();
     tables.sort(); tables.dedup();
-    json!({"tables": tables, "functions": functions, "nodes": root.count(|_| true), "depth": root.tree_depth(), "error": ""})
+    let outputs = match read_output_names(&ast) { Ok(value) => value, Err(error) => return json!({"error": error}) };
+    let mut columns = BTreeSet::new();
+    let mut column_nodes = Vec::new();
+    collect_wrappers(&ast, "column", &mut column_nodes);
+    for column in column_nodes {
+        let Some(name) = identifier_name(column.get("name")) else { return json!({"error": "unsupported column reference"}); };
+        let table = identifier_name(column.get("table"));
+        columns.insert(json!({"table": table.unwrap_or_default(), "name": name}).to_string());
+    }
+    let columns: Vec<Value> = columns.into_iter().filter_map(|value| serde_json::from_str(&value).ok()).collect();
+    json!({"tables": tables, "columns": columns, "outputs": outputs, "functions": functions, "parameters": parameter_count, "nodes": root.count(|_| true), "depth": root.tree_depth(), "error": ""})
+}
+
+fn read_output_names(root: &Value) -> Result<Vec<String>, String> {
+    let Some(kind) = node_kind(root) else { return Err("unsupported read root".into()); };
+    if matches!(kind.as_str(), "union" | "intersect" | "except") {
+        let node = root.get(&kind).and_then(Value::as_object).ok_or("unsupported set operation")?;
+        let left = read_output_names(node.get("left").ok_or("missing set input")?)?;
+        let right = read_output_names(node.get("right").ok_or("missing set input")?)?;
+        if left.len() != right.len() { return Err("set output width mismatch".into()); }
+        return Ok(left);
+    }
+    let select = root.get("select").and_then(Value::as_object).ok_or("unsupported read root")?;
+    let expressions = select.get("expressions").and_then(Value::as_array).ok_or("missing select outputs")?;
+    let mut outputs = Vec::new();
+    for expression in expressions {
+        match node_kind(expression).as_deref() {
+            Some("alias") => {
+                let alias = expression.get("alias").and_then(Value::as_object).and_then(|v| identifier_name(v.get("alias"))).ok_or("invalid output alias")?;
+                outputs.push(alias);
+            }
+            Some("column") => {
+                let name = expression.get("column").and_then(Value::as_object).and_then(|v| identifier_name(v.get("name"))).ok_or("invalid output column")?;
+                outputs.push(name);
+            }
+            Some("star") => outputs.push("*".into()),
+            _ => return Err("computed output requires an alias".into()),
+        }
+    }
+    if outputs.is_empty() { return Err("read has no outputs".into()); }
+    Ok(outputs)
 }
 
 fn has_nonempty_comments(value: &Value) -> bool {

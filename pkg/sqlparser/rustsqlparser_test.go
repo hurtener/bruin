@@ -3,6 +3,7 @@
 package sqlparser
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bruin-data/bruin/pkg/pipeline"
@@ -53,10 +54,12 @@ func TestRustSQLParserInspectRead(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, parser.Start())
 
-	inspection, err := parser.InspectRead("WITH recent AS (SELECT id, amount FROM analytics.facts WHERE id = ?) SELECT id, SUM(amount) FROM recent GROUP BY id", "mysql", 256, 32)
+	inspection, err := parser.InspectRead("WITH recent AS (SELECT id, amount FROM analytics.facts WHERE id = ?) SELECT id, SUM(amount) AS total FROM recent GROUP BY id", "mysql", 256, 32)
 	require.NoError(t, err)
 	require.Equal(t, []string{"analytics.facts"}, inspection.Tables)
 	require.Contains(t, inspection.Functions, "sum")
+	require.Equal(t, []string{"id", "total"}, inspection.Outputs)
+	require.Equal(t, 1, inspection.Parameters)
 	require.Positive(t, inspection.Nodes)
 
 	for _, statement := range []string{
@@ -93,6 +96,28 @@ func TestRustSQLParserInspectReadDialects(t *testing.T) {
 			require.Error(t, err, "parser must consume the complete input")
 		})
 	}
+}
+
+func FuzzRustSQLParserInspectRead(f *testing.F) {
+	for _, seed := range []string{
+		"SELECT id FROM analytics.facts WHERE id = ?",
+		"SELECT 1; DELETE FROM analytics.facts",
+		"SELECT /*!50000 SLEEP(10) */ 1",
+		"SELECT " + strings.Repeat("(", 80) + "1" + strings.Repeat(")", 80),
+		"SELECT @secret",
+	} {
+		f.Add(seed)
+	}
+	parser, err := NewRustSQLParserWithConfig(false, 32768)
+	require.NoError(f, err)
+	f.Fuzz(func(t *testing.T, sql string) {
+		inspection, err := parser.InspectRead(sql, "mysql", 256, 32)
+		if err == nil {
+			require.NotEmpty(t, inspection.Outputs)
+			require.LessOrEqual(t, inspection.Nodes, 256)
+			require.LessOrEqual(t, inspection.Depth, 32)
+		}
+	})
 }
 
 func TestRustSQLParser_HoistDeclares(t *testing.T) {
