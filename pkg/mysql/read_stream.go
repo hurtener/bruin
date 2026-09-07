@@ -24,6 +24,7 @@ type ReadState string
 const (
 	ReadStateRunning         ReadState = "running"
 	ReadStateCancelRequested ReadState = "cancel_requested"
+	ReadStateStopped         ReadState = "stopped"
 	ReadStateIndeterminate   ReadState = "indeterminate"
 )
 
@@ -69,13 +70,16 @@ func (c *Client) ReadStatus(ctx context.Context, identity ReadIdentity, options 
 	if err := c.initializeReadDB(ctx, options.RequireTLS); err != nil {
 		return "", err
 	}
-	var count int
-	err := c.control.QueryRowContext(ctx, `SELECT COUNT(*) FROM performance_schema.threads t JOIN performance_schema.user_variables_by_thread v ON v.THREAD_ID=t.THREAD_ID WHERE t.PROCESSLIST_ID=? AND t.PROCESSLIST_USER=SUBSTRING_INDEX(?, '@', 1) AND COALESCE(t.PROCESSLIST_DB, '')=? AND v.VARIABLE_NAME='bruin_read_attempt' AND CAST(v.VARIABLE_VALUE AS CHAR)=?`, identity.ConnectionID, identity.Account, identity.Database, identity.AttemptTag).Scan(&count)
+	var count, running int
+	err := c.control.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(MAX(t.PROCESSLIST_COMMAND <> 'Sleep'), 0) FROM performance_schema.threads t JOIN performance_schema.user_variables_by_thread v ON v.THREAD_ID=t.THREAD_ID WHERE t.PROCESSLIST_ID=? AND t.PROCESSLIST_USER=SUBSTRING_INDEX(?, '@', 1) AND COALESCE(t.PROCESSLIST_DB, '')=? AND v.VARIABLE_NAME='bruin_read_attempt' AND CAST(v.VARIABLE_VALUE AS CHAR)=?`, identity.ConnectionID, identity.Account, identity.Database, identity.AttemptTag).Scan(&count, &running)
 	if err != nil {
 		return ReadStateIndeterminate, fmt.Errorf("failed to reconcile mysql read identity: %w", err)
 	}
 	if count == 0 {
 		return ReadStateIndeterminate, nil
+	}
+	if running == 0 {
+		return ReadStateStopped, nil
 	}
 	c.readMutex.Lock()
 	defer c.readMutex.Unlock()
@@ -106,6 +110,9 @@ func (c *Client) CancelRead(ctx context.Context, identity ReadIdentity, options 
 		}
 		if state == ReadStateIndeterminate {
 			return ErrReadNotActive
+		}
+		if state == ReadStateStopped {
+			return nil
 		}
 	}
 	// KILL QUERY has no parameter marker. This value was decoded as uint64.
