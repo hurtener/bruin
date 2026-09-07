@@ -2,9 +2,11 @@ package mssql
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bruin-data/bruin/pkg/ansisql"
@@ -16,8 +18,12 @@ import (
 )
 
 type DB struct {
-	conn   *sqlx.DB
-	config *Config
+	readMu              sync.Mutex
+	readClosed          bool
+	readDB, readControl *sql.DB
+	activeReads         map[string]*activeRead
+	conn                *sqlx.DB
+	config              *Config
 }
 
 type Limiter interface {
