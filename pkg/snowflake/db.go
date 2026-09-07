@@ -35,23 +35,32 @@ type DB struct {
 	schemaCreator  *ansisql.SchemaCreator
 	dsn            string
 	mutex          sync.Mutex
+	closed         bool
+	closeOnce      sync.Once
+	closeErr       error
 	typeMapper     *diff.DatabaseTypeMapper
 	connect        func(ctx context.Context) (*sqlx.DB, error)
 	retryDelay     func(attempt int) time.Duration
 	queryIDChannel func() chan string
 }
 
-// Close drains the connection pool so credential rotation cannot reuse a
-// session opened under the prior configuration.
+// ErrClientClosed rejects new work after a client has been retired.
+var ErrClientClosed = stderrors.New("snowflake client is closed")
+
+// Close permanently retires the pool without holding the lifecycle lock while
+// reserved sessions finish or their callers cancel them.
 func (db *DB) Close() error {
-	db.mutex.Lock()
-	defer db.mutex.Unlock()
-	if db.conn == nil {
-		return nil
-	}
-	err := db.conn.Close()
-	db.conn = nil
-	return err
+	db.closeOnce.Do(func() {
+		db.mutex.Lock()
+		db.closed = true
+		pool := db.conn
+		db.conn = nil
+		db.mutex.Unlock()
+		if pool != nil {
+			db.closeErr = pool.Close()
+		}
+	})
+	return db.closeErr
 }
 
 func NewDB(c *Config) (*DB, error) {
@@ -75,21 +84,24 @@ func NewDB(c *Config) (*DB, error) {
 	}, nil
 }
 
-func (db *DB) initializeDB(ctx context.Context) error {
+func (db *DB) initializeDB(ctx context.Context) (*sqlx.DB, error) {
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 
+	if db.closed {
+		return nil, ErrClientClosed
+	}
 	if db.conn != nil {
-		return nil
+		return db.conn, nil
 	}
 
 	conn, err := db.connectDB(ctx)
 	if err != nil {
-		return errors.Wrapf(err, "failed to connect to snowflake")
+		return nil, errors.Wrapf(err, "failed to connect to snowflake")
 	}
 
 	db.conn = conn
-	return nil
+	return conn, nil
 }
 
 func (db *DB) connectDB(ctx context.Context) (*sqlx.DB, error) {
@@ -227,7 +239,8 @@ func (db *DB) Select(ctx context.Context, query *query.Query) ([][]interface{}, 
 }
 
 func (db *DB) selectOnce(ctx context.Context, query *query.Query, requestID *gosnowflake.UUID) ([][]interface{}, error) {
-	if err := db.initializeDB(ctx); err != nil {
+	pool, err := db.initializeDB(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -235,13 +248,13 @@ func (db *DB) selectOnce(ctx context.Context, query *query.Query, requestID *gos
 	qidChan := make(chan string, 1)
 	ctx = withSnowflakeRequestID(ctx, requestID)
 	ctx = gosnowflake.WithQueryIDChan(ctx, qidChan)
-	ctx, err := gosnowflake.WithMultiStatement(ctx, 0)
+	ctx, err = gosnowflake.WithMultiStatement(ctx, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create snowflake context")
 	}
 
 	queryString := query.String()
-	rows, err := db.conn.QueryContext(ctx, queryString)
+	rows, err := pool.QueryContext(ctx, queryString)
 	// Try to print the query ID once the function returns
 	defer logSnowflakeQueryID(ctx, qidChan)
 
@@ -298,7 +311,8 @@ func (db *DB) SelectOnlyLastResult(ctx context.Context, query *query.Query) ([][
 }
 
 func (db *DB) selectOnlyLastResultOnce(ctx context.Context, query *query.Query, requestID *gosnowflake.UUID) ([][]interface{}, error) {
-	if err := db.initializeDB(ctx); err != nil {
+	pool, err := db.initializeDB(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -306,13 +320,13 @@ func (db *DB) selectOnlyLastResultOnce(ctx context.Context, query *query.Query, 
 	qidChan := make(chan string, 1)
 	ctx = withSnowflakeRequestID(ctx, requestID)
 	ctx = gosnowflake.WithQueryIDChan(ctx, qidChan)
-	ctx, err := gosnowflake.WithMultiStatement(ctx, 0)
+	ctx, err = gosnowflake.WithMultiStatement(ctx, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create snowflake context")
 	}
 
 	queryString := query.String()
-	rows, err := db.conn.QueryContext(ctx, queryString)
+	rows, err := pool.QueryContext(ctx, queryString)
 	// Try to print the query ID once the function returns
 	defer logSnowflakeQueryID(ctx, qidChan)
 
@@ -382,7 +396,8 @@ func (db *DB) IsValid(ctx context.Context, query *query.Query) (bool, error) {
 }
 
 func (db *DB) isValidOnce(ctx context.Context, query *query.Query, requestID *gosnowflake.UUID) (bool, error) {
-	if err := db.initializeDB(ctx); err != nil {
+	pool, err := db.initializeDB(ctx)
+	if err != nil {
 		return false, err
 	}
 
@@ -390,12 +405,12 @@ func (db *DB) isValidOnce(ctx context.Context, query *query.Query, requestID *go
 	qidChan := make(chan string, 1)
 	ctx = withSnowflakeRequestID(ctx, requestID)
 	ctx = gosnowflake.WithQueryIDChan(ctx, qidChan)
-	ctx, err := gosnowflake.WithMultiStatement(ctx, 0)
+	ctx, err = gosnowflake.WithMultiStatement(ctx, 0)
 	if err != nil {
 		return false, errors.Wrap(err, "failed to create snowflake context")
 	}
 
-	rows, err := db.conn.QueryContext(ctx, query.ToExplainQuery())
+	rows, err := pool.QueryContext(ctx, query.ToExplainQuery())
 	// Try to print the query ID once the function returns
 	defer logSnowflakeQueryID(ctx, qidChan)
 
@@ -462,7 +477,8 @@ func (db *DB) SelectWithSchema(ctx context.Context, queryObj *query.Query) (*que
 }
 
 func (db *DB) selectWithSchemaOnce(ctx context.Context, queryObj *query.Query, requestID *gosnowflake.UUID) (*query.QueryResult, error) {
-	if err := db.initializeDB(ctx); err != nil {
+	pool, err := db.initializeDB(ctx)
+	if err != nil {
 		return nil, err
 	}
 	// Prepare Snowflake context for the query execution
@@ -470,14 +486,14 @@ func (db *DB) selectWithSchemaOnce(ctx context.Context, queryObj *query.Query, r
 	qidChan := make(chan string, 1)
 	ctx = withSnowflakeRequestID(ctx, requestID)
 	ctx = gosnowflake.WithQueryIDChan(ctx, qidChan)
-	ctx, err := gosnowflake.WithMultiStatement(ctx, 0)
+	ctx, err = gosnowflake.WithMultiStatement(ctx, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create snowflake context")
 	}
 
 	// Convert query object to string and execute it
 	queryString := queryObj.String()
-	rows, err := db.conn.QueryContext(ctx, queryString)
+	rows, err := pool.QueryContext(ctx, queryString)
 	// Try to print the query ID once the function returns
 	defer logSnowflakeQueryID(ctx, qidChan)
 

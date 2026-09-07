@@ -81,10 +81,11 @@ func (c *Client) ReadStatus(ctx context.Context, identity ReadIdentity, options 
 	if !identity.valid() {
 		return "", ErrReadIdentity
 	}
-	if err := c.initializeReadDB(ctx, options.RequireTLS); err != nil {
+	_, pool, err := c.initializeReadDB(ctx, options.RequireTLS)
+	if err != nil {
 		return "", err
 	}
-	control, err := c.control.Connx(ctx)
+	control, err := pool.Connx(ctx)
 	if err != nil {
 		return ReadStateIndeterminate, fmt.Errorf("failed to reserve mysql control connection: %w", err)
 	}
@@ -120,10 +121,11 @@ func (c *Client) CancelRead(ctx context.Context, identity ReadIdentity, options 
 	if !identity.valid() {
 		return ErrReadIdentity
 	}
-	if err := c.initializeReadDB(ctx, options.RequireTLS); err != nil {
+	_, pool, err := c.initializeReadDB(ctx, options.RequireTLS)
+	if err != nil {
 		return err
 	}
-	control, err := c.control.Connx(ctx)
+	control, err := pool.Connx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to reserve mysql control connection: %w", err)
 	}
@@ -190,10 +192,11 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 	if !readTagPattern.MatchString(attemptTag) {
 		return nil, ReadIdentity{}, ErrReadIdentity
 	}
-	if err := c.initializeReadDB(ctx, options.RequireTLS); err != nil {
+	pool, _, err := c.initializeReadDB(ctx, options.RequireTLS)
+	if err != nil {
 		return nil, ReadIdentity{}, err
 	}
-	conn, err := c.readConn.Connx(ctx)
+	conn, err := pool.Connx(ctx)
 	if err != nil {
 		return nil, ReadIdentity{}, fmt.Errorf("failed to reserve mysql connection: %w", err)
 	}
@@ -322,35 +325,38 @@ func (s *sessionRows) Values() ([]any, error) {
 func (s *sessionRows) Err() error   { return s.rows.Err() }
 func (s *sessionRows) Close() error { return s.rows.Close() }
 
-func (c *Client) initializeReadDB(ctx context.Context, requireTLS bool) error {
+func (c *Client) initializeReadDB(ctx context.Context, requireTLS bool) (*sqlx.DB, *sqlx.DB, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+	if c.closed {
+		return nil, nil, ErrClientClosed
+	}
 	if c.readConn != nil {
 		if requireTLS {
 			parsed, err := mysqldriver.ParseDSN(c.config.ToDBConnectionURI())
 			if err != nil || parsed.TLSConfig == "" || parsed.TLSConfig == "false" {
-				return errors.New("mysql governed read requires explicit TLS")
+				return nil, nil, errors.New("mysql governed read requires explicit TLS")
 			}
 		}
-		return nil
+		return c.readConn, c.control, nil
 	}
 	dsn, err := governedReadDSN(c.config.ToDBConnectionURI(), requireTLS)
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	readConn, err := sqlx.ConnectContext(ctx, "mysql", dsn)
 	if err != nil {
-		return fmt.Errorf("failed to connect mysql read pool: %w", err)
+		return nil, nil, fmt.Errorf("failed to connect mysql read pool: %w", err)
 	}
 	control, err := sqlx.ConnectContext(ctx, "mysql", dsn)
 	if err != nil {
 		_ = readConn.Close()
-		return fmt.Errorf("failed to connect mysql control pool: %w", err)
+		return nil, nil, fmt.Errorf("failed to connect mysql control pool: %w", err)
 	}
 	control.SetMaxOpenConns(2)
 	control.SetMaxIdleConns(2)
 	c.readConn, c.control = readConn, control
-	return nil
+	return readConn, control, nil
 }
 
 func governedReadDSN(raw string, requireTLS bool) (string, error) {

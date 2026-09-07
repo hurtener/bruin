@@ -37,9 +37,15 @@ type Client struct {
 	control     *sqlx.DB
 	config      MySQLConfig
 	mutex       sync.Mutex
+	closed      bool
+	closeOnce   sync.Once
+	closeErr    error
 	readMutex   sync.Mutex
 	activeReads map[string]*activeRead
 }
+
+// ErrClientClosed rejects new work after a client has been retired.
+var ErrClientClosed = stderrors.New("mysql client is closed")
 
 type MySQLConfig interface {
 	GetIngestrURI() string
@@ -58,41 +64,50 @@ func NewClientWithContext(ctx context.Context, c MySQLConfig) (*Client, error) {
 	}, nil
 }
 
-func (c *Client) initializeDB(ctx context.Context) error {
+func (c *Client) initializeDB(ctx context.Context) (*sqlx.DB, error) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	if c.closed {
+		return nil, ErrClientClosed
+	}
 	if c.conn != nil {
-		return nil
+		return c.conn, nil
 	}
 
 	conn, err := sqlx.ConnectContext(ctx, "mysql", c.config.ToDBConnectionURI())
 	if err != nil {
-		return errors.Wrapf(err, "failed to connect to mysql")
+		return nil, errors.Wrapf(err, "failed to connect to mysql")
 	}
 
 	c.conn = conn
-	return nil
+	return conn, nil
 }
 
-// Close releases all legacy, governed-read, and reserved control pools.
+// Close permanently retires all pools. Already reserved sessions retain their
+// ordinary driver lifetime; no lifecycle lock blocks their cancellation.
 func (c *Client) Close() error {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	var errs []error
-	seen := make(map[*sqlx.DB]struct{}, 3)
-	for _, db := range []*sqlx.DB{c.conn, c.readConn, c.control} {
-		if db == nil {
-			continue
+	c.closeOnce.Do(func() {
+		c.mutex.Lock()
+		c.closed = true
+		pools := []*sqlx.DB{c.conn, c.readConn, c.control}
+		c.conn, c.readConn, c.control = nil, nil, nil
+		c.mutex.Unlock()
+		var errs []error
+		seen := make(map[*sqlx.DB]struct{}, len(pools))
+		for _, pool := range pools {
+			if pool == nil {
+				continue
+			}
+			if _, ok := seen[pool]; ok {
+				continue
+			}
+			seen[pool] = struct{}{}
+			errs = append(errs, pool.Close())
 		}
-		if _, ok := seen[db]; ok {
-			continue
-		}
-		seen[db] = struct{}{}
-		errs = append(errs, db.Close())
-	}
-	c.conn, c.readConn, c.control = nil, nil, nil
-	return stderrors.Join(errs...)
+		c.closeErr = stderrors.Join(errs...)
+	})
+	return c.closeErr
 }
 
 func (c *Client) GetIngestrURI() (string, error) {
@@ -105,10 +120,11 @@ func (c *Client) GetIngestrURI() (string, error) {
 //}
 
 func (c *Client) RunQueryWithoutResult(ctx context.Context, query *query.Query) error {
-	if err := c.initializeDB(ctx); err != nil {
+	pool, err := c.initializeDB(ctx)
+	if err != nil {
 		return err
 	}
-	_, err := c.conn.ExecContext(ctx, query.String())
+	_, err = pool.ExecContext(ctx, query.String())
 	if err != nil {
 		return errors.Wrap(err, "failed to execute query")
 	}
@@ -117,10 +133,11 @@ func (c *Client) RunQueryWithoutResult(ctx context.Context, query *query.Query) 
 }
 
 func (c *Client) Select(ctx context.Context, query *query.Query) ([][]interface{}, error) {
-	if err := c.initializeDB(ctx); err != nil {
+	pool, err := c.initializeDB(ctx)
+	if err != nil {
 		return nil, err
 	}
-	rows, err := c.conn.QueryContext(ctx, query.String())
+	rows, err := pool.QueryContext(ctx, query.String())
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to execute query")
 	}
@@ -162,11 +179,12 @@ func (c *Client) Select(ctx context.Context, query *query.Query) ([][]interface{
 }
 
 func (c *Client) SelectWithSchema(ctx context.Context, queryObj *query.Query) (*query.QueryResult, error) {
-	if err := c.initializeDB(ctx); err != nil {
+	pool, err := c.initializeDB(ctx)
+	if err != nil {
 		return nil, err
 	}
 	queryString := queryObj.String()
-	rows, err := c.conn.QueryContext(ctx, queryString)
+	rows, err := pool.QueryContext(ctx, queryString)
 	if err != nil {
 		errorMessage := err.Error()
 		err = errors.New(strings.ReplaceAll(errorMessage, "\n", "  -  "))

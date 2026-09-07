@@ -66,10 +66,11 @@ func (db *DB) OpenRead(ctx context.Context, queryObj *query.Query, attemptTag st
 	if err := validateReadArgs(queryObj.Args); err != nil {
 		return nil, ReadIdentity{}, err
 	}
-	if err := db.initializeDB(ctx); err != nil {
+	pool, err := db.initializeDB(ctx)
+	if err != nil {
 		return nil, ReadIdentity{}, err
 	}
-	conn, err := db.conn.Connx(ctx)
+	conn, err := pool.Connx(ctx)
 	if err != nil {
 		return nil, ReadIdentity{}, fmt.Errorf("failed to reserve snowflake read session: %w", err)
 	}
@@ -148,18 +149,19 @@ func (db *DB) ReadStatus(ctx context.Context, identity ReadIdentity) (ReadState,
 	if !identity.validAcknowledged() {
 		return "", ErrReadIdentity
 	}
-	if err := db.initializeDB(ctx); err != nil {
+	pool, err := db.initializeDB(ctx)
+	if err != nil {
 		return ReadStateIndeterminate, err
 	}
 	var account, database string
-	if err := db.conn.QueryRowContext(ctx, "SELECT CURRENT_ACCOUNT(), CURRENT_DATABASE()").Scan(&account, &database); err != nil || account != identity.Account || database != identity.Database {
+	if err := pool.QueryRowContext(ctx, "SELECT CURRENT_ACCOUNT(), CURRENT_DATABASE()").Scan(&account, &database); err != nil || account != identity.Account || database != identity.Database {
 		if err == nil {
 			err = errors.New("snowflake account or database identity changed")
 		}
 		return ReadStateIndeterminate, err
 	}
 	var status, tag string
-	err := db.conn.QueryRowContext(ctx, `SELECT EXECUTION_STATUS, COALESCE(QUERY_TAG, '') FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(SESSION_ID => ?, RESULT_LIMIT => 1000)) WHERE QUERY_ID = ?`, identity.SessionID, identity.QueryID).Scan(&status, &tag)
+	err = pool.QueryRowContext(ctx, `SELECT EXECUTION_STATUS, COALESCE(QUERY_TAG, '') FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(SESSION_ID => ?, RESULT_LIMIT => 1000)) WHERE QUERY_ID = ?`, identity.SessionID, identity.QueryID).Scan(&status, &tag)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ReadStateIndeterminate, nil
 	}
@@ -190,8 +192,12 @@ func (db *DB) CancelRead(ctx context.Context, identity ReadIdentity) error {
 	if state != ReadStateRunning {
 		return ErrReadNotActive
 	}
+	pool, err := db.initializeDB(ctx)
+	if err != nil {
+		return err
+	}
 	var result string
-	if err = db.conn.QueryRowContext(ctx, "SELECT SYSTEM$CANCEL_QUERY(?)", identity.QueryID).Scan(&result); err != nil {
+	if err = pool.QueryRowContext(ctx, "SELECT SYSTEM$CANCEL_QUERY(?)", identity.QueryID).Scan(&result); err != nil {
 		return fmt.Errorf("failed to cancel snowflake read: %w", err)
 	}
 	if result == "" {
@@ -241,12 +247,14 @@ func ownedReadValue(value any) any {
 		return value
 	}
 }
+
 func (s *ReadStream) Err() error {
 	if err := s.rows.Err(); err != nil {
 		return fmt.Errorf("snowflake result iteration failed: %w", err)
 	}
 	return nil
 }
+
 func (s *ReadStream) Close() error {
 	s.close.Do(func() { s.closeErr = errors.Join(s.rows.Close(), s.conn.Close()) })
 	return s.closeErr
