@@ -3,6 +3,7 @@ package databricks
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -25,6 +26,11 @@ var disableDriverLogs = sync.OnceFunc(func() {
 })
 
 type DB struct {
+	readClosed    bool
+	readConfig    *Config
+	readHTTP      *http.Client
+	readContext   context.Context
+	readCancel    context.CancelFunc
 	conn          *sqlx.DB
 	config        *Config
 	schemaCreator *ansisql.SchemaCreator
@@ -42,6 +48,9 @@ func (db *DB) ensureConnection() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	if db.readClosed {
+		return ErrReadClosed
+	}
 	if db.conn != nil {
 		return nil
 	}
