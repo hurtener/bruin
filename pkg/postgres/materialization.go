@@ -1064,9 +1064,9 @@ func buildSCD2ByColumnQuery(asset *pipeline.Asset, query string) (string, error)
 		insertValues = append(insertValues, "source."+lowerColName)
 		if !col.PrimaryKey {
 			compareConds = append(compareConds,
-				fmt.Sprintf("target.%s != source.%s", lowerColName, lowerColName))
+				fmt.Sprintf("target.%s IS DISTINCT FROM source.%s", lowerColName, lowerColName))
 			compareCondsS1T1 = append(compareCondsS1T1,
-				fmt.Sprintf("t1.%s != s1.%s", lowerColName, lowerColName))
+				fmt.Sprintf("t1.%s IS DISTINCT FROM s1.%s", lowerColName, lowerColName))
 		}
 	}
 

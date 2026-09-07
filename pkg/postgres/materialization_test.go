@@ -1075,12 +1075,12 @@ func TestBuildSCD2ByColumnQuery(t *testing.T) {
 				"  SELECT s1.*, FALSE AS _is_current\n" +
 				"  FROM   s1\n" +
 				"  JOIN   \"my\".\"asset\" AS t1 USING (id)\n" +
-				"  WHERE  (t1.col1 != s1.col1 OR t1.col2 != s1.col2 OR t1.col3 != s1.col3 OR t1.col4 != s1.col4) AND t1._is_current\n" +
+				"  WHERE  (t1.col1 IS DISTINCT FROM s1.col1 OR t1.col2 IS DISTINCT FROM s1.col2 OR t1.col3 IS DISTINCT FROM s1.col3 OR t1.col4 IS DISTINCT FROM s1.col4) AND t1._is_current\n" +
 				") AS source\n" +
 				"ON  target.id = source.id AND target._is_current AND source._is_current\n" +
 				"\n" +
 				"WHEN MATCHED AND (\n" +
-				"    target.col1 != source.col1 OR target.col2 != source.col2 OR target.col3 != source.col3 OR target.col4 != source.col4\n" +
+				"    target.col1 IS DISTINCT FROM source.col1 OR target.col2 IS DISTINCT FROM source.col2 OR target.col3 IS DISTINCT FROM source.col3 OR target.col4 IS DISTINCT FROM source.col4\n" +
 				") THEN\n" +
 				"  UPDATE SET\n" +
 				"    _valid_until = CURRENT_TIMESTAMP,\n" +
@@ -1122,12 +1122,12 @@ func TestBuildSCD2ByColumnQuery(t *testing.T) {
 				"  SELECT s1.*, FALSE AS _is_current\n" +
 				"  FROM   s1\n" +
 				"  JOIN   \"my\".\"asset\" AS t1 USING (id, category)\n" +
-				"  WHERE  (t1.name != s1.name OR t1.price != s1.price) AND t1._is_current\n" +
+				"  WHERE  (t1.name IS DISTINCT FROM s1.name OR t1.price IS DISTINCT FROM s1.price) AND t1._is_current\n" +
 				") AS source\n" +
 				"ON  target.id = source.id AND target.category = source.category AND target._is_current AND source._is_current\n" +
 				"\n" +
 				"WHEN MATCHED AND (\n" +
-				"    target.name != source.name OR target.price != source.price\n" +
+				"    target.name IS DISTINCT FROM source.name OR target.price IS DISTINCT FROM source.price\n" +
 				") THEN\n" +
 				"  UPDATE SET\n" +
 				"    _valid_until = CURRENT_TIMESTAMP,\n" +
@@ -1199,12 +1199,12 @@ func TestBuildSCD2ByColumnQuery(t *testing.T) {
 				"  SELECT s1.*, FALSE AS _is_current\n" +
 				"  FROM   s1\n" +
 				"  JOIN   \"my\".\"asset\" AS t1 USING (id)\n" +
-				"  WHERE  (t1.col1 != s1.col1 OR t1.col2 != s1.col2 OR t1.updated_at != s1.updated_at) AND t1._is_current\n" +
+				"  WHERE  (t1.col1 IS DISTINCT FROM s1.col1 OR t1.col2 IS DISTINCT FROM s1.col2 OR t1.updated_at IS DISTINCT FROM s1.updated_at) AND t1._is_current\n" +
 				") AS source\n" +
 				"ON  target.id = source.id AND target._is_current AND source._is_current\n" +
 				"\n" +
 				"WHEN MATCHED AND (\n" +
-				"    target.col1 != source.col1 OR target.col2 != source.col2 OR target.updated_at != source.updated_at\n" +
+				"    target.col1 IS DISTINCT FROM source.col1 OR target.col2 IS DISTINCT FROM source.col2 OR target.updated_at IS DISTINCT FROM source.updated_at\n" +
 				") THEN\n" +
 				"  UPDATE SET\n" +
 				"    _valid_until = source.updated_at,\n" +
@@ -1874,3 +1874,14 @@ func TestBuildRedshiftSCD2ByColumnQuery(t *testing.T) {
 }
 
 func intp(i int) *int { return &i }
+
+func TestSCD2ByColumnNullTransitions(t *testing.T) {
+	asset := &pipeline.Asset{Name: "managed.history", Materialization: pipeline.Materialization{Type: pipeline.MaterializationTypeTable, Strategy: pipeline.MaterializationStrategySCD2ByColumn}, Columns: []pipeline.Column{{Name: "id", PrimaryKey: true}, {Name: "value", Type: "text"}}}
+	sql, err := buildSCD2ByColumnQuery(asset, "SELECT id,value FROM source_table")
+	require.NoError(t, err)
+	// Both the expired-row branch and the incoming-current-row branch must agree
+	// on NULL transitions; ordinary inequality yields UNKNOWN for either one.
+	require.Contains(t, sql, "t1.value IS DISTINCT FROM s1.value")
+	require.Contains(t, sql, "target.value IS DISTINCT FROM source.value")
+	require.NotContains(t, sql, " != ")
+}
