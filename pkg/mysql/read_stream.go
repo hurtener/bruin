@@ -202,6 +202,13 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 	if err != nil {
 		return fail(fmt.Errorf("failed to begin mysql read-only transaction: %w", err))
 	}
+	// sql_select_limit is a session variable and survives rollback when a pooled
+	// connection is reused. Restore the verifier ceiling before any metadata read;
+	// the caller's result ceiling is installed only after verification below.
+	if _, err := tx.ExecContext(ctx, "SET SESSION sql_select_limit = 100001"); err != nil {
+		_ = tx.Rollback()
+		return fail(fmt.Errorf("failed to reset mysql verifier row bound: %w", err))
+	}
 	var identity ReadIdentity
 	if _, err := tx.ExecContext(ctx, "SET @bruin_read_attempt = ?", attemptTag); err != nil {
 		_ = tx.Rollback()
