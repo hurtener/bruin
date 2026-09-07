@@ -55,6 +55,9 @@ type ReadOptions struct {
 	// performance_schema.threads and performance_schema.user_variables_by_thread;
 	// without both, ReadStatus returns indeterminate with the native error.
 	RequireTLS bool
+	// MaxRows applies MySQL's native per-session select ceiling before user SQL.
+	// Zero uses the connector's conservative default.
+	MaxRows int
 }
 
 // ReadSession is the reserved read-only transaction used to establish native
@@ -209,6 +212,18 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 		return fail(fmt.Errorf("failed to identify mysql read session: %w", err))
 	}
 	identity.AttemptTag = attemptTag
+	maximumRows := options.MaxRows
+	if maximumRows == 0 {
+		maximumRows = 100001
+	}
+	if maximumRows < 1 || maximumRows > 100001 {
+		_ = tx.Rollback()
+		return fail(errors.New("mysql governed read row bound is invalid"))
+	}
+	if _, err := tx.ExecContext(ctx, "SET SESSION sql_select_limit = ?", maximumRows); err != nil {
+		_ = tx.Rollback()
+		return fail(fmt.Errorf("failed to set mysql result row bound: %w", err))
+	}
 	c.readMutex.Lock()
 	if c.activeReads == nil {
 		c.activeReads = make(map[string]*activeRead)
@@ -339,6 +354,7 @@ func governedReadDSN(raw string, requireTLS bool) (string, error) {
 	}
 	parsed.MultiStatements = false
 	parsed.InterpolateParams = false
+	parsed.MaxAllowedPacket = (16 << 20) + 32768
 	return parsed.FormatDSN(), nil
 }
 

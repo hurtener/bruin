@@ -126,6 +126,7 @@ func TestOpenReadBindsArgumentsAndExposesEmptySchema(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("SET @bruin_read_attempt = ?").WithArgs("attempt-1").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), ''), @@server_uuid").WillReturnRows(sqlmock.NewRows([]string{"id", "account", "database", "server_uuid"}).AddRow(42, "reader@%", "warehouse", "server-uuid"))
+	mock.ExpectExec("SET SESSION sql_select_limit = ?").WithArgs(100001).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT amount, payload FROM facts WHERE id = ?").WithArgs(int64(7)).WillReturnRows(sqlmock.NewRowsWithColumnDefinition(
 		sqlmock.NewColumn("amount").OfType("DECIMAL", []byte{}).WithPrecisionAndScale(38, 9),
 		sqlmock.NewColumn("payload").OfType("BLOB", []byte{}),
@@ -157,6 +158,7 @@ func TestOpenReadVerifiedUsesSameTransactionBeforeDispatch(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectExec("SET @bruin_read_attempt = ?").WithArgs("attempt-1").WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), ''), @@server_uuid").WillReturnRows(sqlmock.NewRows([]string{"id", "account", "database", "server_uuid"}).AddRow(42, "reader@%", "warehouse", "server-uuid"))
+	mock.ExpectExec("SET SESSION sql_select_limit = ?").WithArgs(100001).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectQuery("SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = ?").WithArgs("warehouse").WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("facts"))
 	mock.ExpectQuery("SELECT amount FROM facts").WillReturnRows(sqlmock.NewRows([]string{"amount"}))
 	mock.ExpectRollback()
