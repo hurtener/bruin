@@ -91,13 +91,13 @@ func TestOpenReadJournalsBeforeDispatchAndRejectsUnsafeArguments(t *testing.T) {
 
 	_, _, err = db.OpenRead(t.Context(), &query.Query{Query: "SELECT ?", Args: []any{uint64(7)}}, "attempt-2", &recordingReadObserver{})
 	require.ErrorContains(t, err, "argument type is unsupported")
-	require.Equal(t, deterministicRequestID("attempt-1"), deterministicRequestID("attempt-1"))
-	require.NotEqual(t, deterministicRequestID("attempt-1"), deterministicRequestID("attempt-2"))
+	require.Equal(t, deterministicRequestID("attempt-1", "ORG.ACCOUNT", "WAREHOUSE"), deterministicRequestID("attempt-1", "ORG.ACCOUNT", "WAREHOUSE"))
+	require.NotEqual(t, deterministicRequestID("attempt-1", "ORG.ACCOUNT", "WAREHOUSE"), deterministicRequestID("attempt-2", "ORG.ACCOUNT", "WAREHOUSE"))
 }
 
 func TestReadStatusBindsFullIdentityAndCancelRequiresRunningProof(t *testing.T) {
 	t.Parallel()
-	identity := ReadIdentity{RequestID: deterministicRequestID("attempt-1").String(), QueryID: "qid-1", QueryTag: "cw:attempt-1", Account: "ORG.ACCOUNT", Database: "WAREHOUSE", SessionID: 42}
+	identity := ReadIdentity{RequestID: deterministicRequestID("attempt-1", "ORG.ACCOUNT", "WAREHOUSE").String(), QueryID: "qid-1", QueryTag: "cw:attempt-1", Account: "ORG.ACCOUNT", Database: "WAREHOUSE", SessionID: 42}
 	db, mock := snowflakeMock(t)
 	mock.ExpectQuery("SELECT CURRENT_ACCOUNT(), CURRENT_DATABASE()").WillReturnRows(sqlmock.NewRows([]string{"account", "database"}).AddRow(identity.Account, identity.Database))
 	mock.ExpectQuery(`SELECT EXECUTION_STATUS, COALESCE(QUERY_TAG, '') FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(SESSION_ID => ?, RESULT_LIMIT => 1000)) WHERE QUERY_ID = ?`).WithArgs(identity.SessionID, identity.QueryID).WillReturnRows(sqlmock.NewRows([]string{"status", "tag"}).AddRow("RUNNING", identity.QueryTag))
@@ -114,7 +114,7 @@ func TestReadStatusBindsFullIdentityAndCancelRequiresRunningProof(t *testing.T) 
 
 func TestReadStatusRejectsMismatchAndUnknownCancellation(t *testing.T) {
 	t.Parallel()
-	identity := ReadIdentity{RequestID: deterministicRequestID("attempt-1").String(), QueryID: "qid-1", QueryTag: "cw:attempt-1", Account: "ORG.ACCOUNT", Database: "WAREHOUSE", SessionID: 42}
+	identity := ReadIdentity{RequestID: deterministicRequestID("attempt-1", "ORG.ACCOUNT", "WAREHOUSE").String(), QueryID: "qid-1", QueryTag: "cw:attempt-1", Account: "ORG.ACCOUNT", Database: "WAREHOUSE", SessionID: 42}
 	db, mock := snowflakeMock(t)
 	mock.ExpectQuery("SELECT CURRENT_ACCOUNT(), CURRENT_DATABASE()").WillReturnRows(sqlmock.NewRows([]string{"account", "database"}).AddRow(identity.Account, identity.Database))
 	mock.ExpectQuery(`SELECT EXECUTION_STATUS, COALESCE(QUERY_TAG, '') FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY_BY_SESSION(SESSION_ID => ?, RESULT_LIMIT => 1000)) WHERE QUERY_ID = ?`).WithArgs(identity.SessionID, identity.QueryID).WillReturnRows(sqlmock.NewRows([]string{"status", "tag"}).AddRow("RUNNING", "cw:other"))

@@ -77,10 +77,11 @@ func (db *DB) OpenRead(ctx context.Context, queryObj *query.Query, attemptTag st
 		_ = conn.Close()
 		return nil, ReadIdentity{}, err
 	}
-	identity := ReadIdentity{RequestID: deterministicRequestID(attemptTag).String(), QueryTag: "cw:" + attemptTag}
+	identity := ReadIdentity{QueryTag: "cw:" + attemptTag}
 	if err = conn.QueryRowContext(ctx, "SELECT CURRENT_ACCOUNT(), CURRENT_DATABASE(), CURRENT_SESSION()").Scan(&identity.Account, &identity.Database, &identity.SessionID); err != nil {
 		return fail(fmt.Errorf("failed to identify snowflake read session: %w", err))
 	}
+	identity.RequestID = deterministicRequestID(attemptTag, identity.Account, identity.Database).String()
 	if !identity.validDispatch() {
 		return fail(ErrReadIdentity)
 	}
@@ -117,8 +118,8 @@ func (db *DB) OpenRead(ctx context.Context, queryObj *query.Query, attemptTag st
 	return &ReadStream{columns: query.ColumnsFromSQL(columnTypes), rows: rows, conn: conn.Conn}, identity, nil
 }
 
-func deterministicRequestID(attemptTag string) gosnowflake.UUID {
-	sum := sha256.Sum256([]byte("chartworks:snowflake:" + attemptTag))
+func deterministicRequestID(attemptTag, account, database string) gosnowflake.UUID {
+	sum := sha256.Sum256([]byte("chartworks:snowflake:" + account + ":" + database + ":" + attemptTag))
 	var id gosnowflake.UUID
 	copy(id[:], sum[:16])
 	id[6] = (id[6] & 0x0f) | 0x50
