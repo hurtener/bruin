@@ -27,6 +27,16 @@ var (
 	readParameterName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 )
 
+// ReadFailure preserves the query error and separately reports acknowledged
+// cleanup of the original owned transaction. It never infers stop from a socket close.
+type ReadFailure struct {
+	Cause   error
+	Stopped bool
+}
+
+func (e *ReadFailure) Error() string { return e.Cause.Error() }
+func (e *ReadFailure) Unwrap() error { return e.Cause }
+
 type ReadIdentity struct {
 	SessionID                             int32
 	LoginTime                             time.Time
@@ -177,8 +187,18 @@ func (db *DB) OpenReadVerified(ctx context.Context, q *query.Query, attempt stri
 		return nil, ReadIdentity{}, err
 	}
 	discard := func() { _ = conn.Raw(func(any) error { return driver.ErrBadConn }); _ = conn.Close() }
-	tx, err := conn.BeginTx(work, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	// Query I/O keeps work's deadline. Only transaction cleanup receives a
+	// separate bounded allowance, so cancellation does not hide an automatic
+	// rollback result before the owner can observe its acknowledgement.
+	grace := o.CancelTimeout
+	if grace < time.Millisecond || grace > 30*time.Second {
+		grace = time.Second
+	}
+	until, _ := work.Deadline()
+	cleanupContext, stopTransaction := context.WithDeadline(context.WithoutCancel(work), until.Add(grace))
+	tx, err := conn.BeginTx(cleanupContext, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
+		stopTransaction()
 		cancel()
 		discard()
 		return nil, ReadIdentity{}, err
@@ -188,6 +208,7 @@ func (db *DB) OpenReadVerified(ctx context.Context, q *query.Query, attempt stri
 	if err != nil || !identity.valid() {
 		cancel()
 		_ = tx.Rollback()
+		stopTransaction()
 		discard()
 		if err == nil {
 			err = ErrReadIdentity
@@ -197,6 +218,7 @@ func (db *DB) OpenReadVerified(ctx context.Context, q *query.Query, attempt stri
 	if _, err = tx.ExecContext(work, readTagSQL, []byte(attempt)); err != nil {
 		cancel()
 		_ = tx.Rollback()
+		stopTransaction()
 		discard()
 		return nil, identity, err
 	}
@@ -210,9 +232,10 @@ func (db *DB) OpenReadVerified(ctx context.Context, q *query.Query, attempt stri
 			if rows != nil {
 				finishErr = rows.Close()
 			}
-			if rollbackErr := tx.Rollback(); rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
 				finishErr = errors.Join(finishErr, rollbackErr)
 			}
+			stopTransaction()
 			discard()
 			db.readMu.Lock()
 			if db.activeReads[attempt] == a {
@@ -232,7 +255,10 @@ func (db *DB) OpenReadVerified(ctx context.Context, q *query.Query, attempt stri
 	db.activeReads[attempt] = a
 	db.readMu.Unlock()
 	defer close(a.ready)
-	fail := func(e error) (*ReadStream, ReadIdentity, error) { _ = a.finish(); return nil, identity, e }
+	fail := func(e error) (*ReadStream, ReadIdentity, error) {
+		cleanupErr := a.finish()
+		return nil, identity, &ReadFailure{Cause: errors.Join(e, cleanupErr), Stopped: cleanupErr == nil}
+	}
 	if verify != nil {
 		if err = verify(work, readSession{tx: tx}); err != nil {
 			return fail(err)

@@ -255,3 +255,27 @@ func TestReadNativeParameterCompatibility(t *testing.T) {
 		}
 	}
 }
+
+func TestReadFailureCleanupEvidence(t *testing.T) {
+	queryError := errors.New("synthetic query failure")
+	for _, fails := range []bool{false, true} {
+		name := "acknowledged rollback"
+		if fails {
+			name = "unresolved rollback"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, mock, _ := fixtureReadDB(t)
+			expectReadSession(mock)
+			mock.ExpectQuery("SELECT failure").WillReturnError(queryError)
+			rollback := mock.ExpectRollback()
+			if fails {
+				rollback.WillReturnError(errors.New("synthetic transport loss"))
+			}
+			_, _, err := db.OpenRead(context.Background(), &query.Query{Query: "SELECT failure"}, "attempt", &readObserverFixture{}, fixtureOptions())
+			var failure *ReadFailure
+			if !errors.As(err, &failure) || !errors.Is(err, queryError) || failure.Stopped == fails {
+				t.Fatalf("cleanup evidence: %#v %v", failure, err)
+			}
+		})
+	}
+}
