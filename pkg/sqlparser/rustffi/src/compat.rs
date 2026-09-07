@@ -5,6 +5,8 @@ use polyglot_sql::validation::{
     mapping_schema_from_validation_schema, SchemaColumn, SchemaTable, ValidationSchema,
 };
 use polyglot_sql::{generate, parse, parse_one, DialectType, Expression};
+use polyglot_sql::traversal::ExpressionWalk;
+use polyglot_sql::expressions::ParameterStyle;
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1984,6 +1986,113 @@ pub fn is_single_select_query(query: &str, dialect: DialectType) -> Value {
         "is_single_select": matches!(kind.as_deref(), Some("select" | "union" | "intersect" | "except")),
         "error": "",
     })
+}
+
+pub fn inspect_read(query: &str, dialect: DialectType, max_nodes: usize, max_depth: usize) -> Value {
+    if query.trim().is_empty() || query.contains("/*!") || query.contains("/*+") {
+        return json!({"error": "unsupported read syntax"});
+    }
+    let statements = match parse(query, dialect) {
+        Ok(value) if value.len() == 1 => value,
+        _ => return json!({"error": "exactly one readable statement is required"}),
+    };
+    let root = &statements[0];
+    let root_kind = node_kind(&expression_to_value(root)).unwrap_or_default();
+    if !matches!(root_kind.as_str(), "select" | "union" | "intersect" | "except") {
+        return json!({"error": "statement is not a read query"});
+    }
+    let nodes: Vec<_> = root.dfs().collect();
+    if nodes.len() > max_nodes || root.tree_depth() > max_depth {
+        return json!({"error": "read syntax bounds exceeded"});
+    }
+    let allowed = [
+        "select", "union", "intersect", "except", "subquery", "alias", "cast", "case",
+        "and", "or", "add", "sub", "mul", "div", "mod", "eq", "neq", "lt", "lte", "gt", "gte",
+        "like", "ilike", "not", "neg", "in", "between", "is_null", "is_true", "is_false", "is", "exists",
+        "from", "join", "joined_table", "where", "group_by", "having", "order_by", "limit", "offset", "with", "cte", "ordered",
+        "window", "over", "within_group", "data_type", "array", "struct", "tuple", "interval",
+        "literal", "boolean", "null", "identifier", "column", "table", "star", "parameter", "placeholder",
+        "function", "aggregate_function", "window_function", "count", "sum", "avg", "min", "max", "coalesce", "nullif", "greatest", "least", "if", "if_null",
+        "concat_ws", "substring", "upper", "lower", "length", "trim", "l_trim", "r_trim", "replace", "reverse", "left", "right", "repeat", "lpad", "rpad", "split",
+        "regexp_like", "regexp_replace", "regexp_extract", "abs", "round", "floor", "ceil", "power", "sqrt", "cbrt", "ln", "log", "exp", "sign",
+        "current_date", "current_time", "current_timestamp", "date_add", "date_sub", "date_diff", "date_format", "extract",
+        "row_number", "rank", "dense_rank", "lag", "lead", "first_value", "last_value", "nth_value", "ntile",
+    ];
+    let allowed: HashSet<&str> = allowed.into_iter().collect();
+    let function_kinds: HashSet<&str> = [
+        "function", "aggregate_function", "window_function", "count", "sum", "avg", "min", "max", "coalesce", "nullif", "greatest", "least", "if", "if_null",
+        "concat_ws", "substring", "upper", "lower", "length", "trim", "l_trim", "r_trim", "replace", "reverse", "left", "right", "repeat", "lpad", "rpad", "split",
+        "regexp_like", "regexp_replace", "regexp_extract", "abs", "round", "floor", "ceil", "power", "sqrt", "cbrt", "ln", "log", "exp", "sign",
+        "current_date", "current_time", "current_timestamp", "date_add", "date_sub", "date_diff", "date_format", "extract",
+        "row_number", "rank", "dense_rank", "lag", "lead", "first_value", "last_value", "nth_value", "ntile",
+    ].into_iter().collect();
+    let mut functions = BTreeSet::new();
+    for node in nodes {
+        if let Expression::Parameter(parameter) = node {
+            let supported = matches!((dialect, parameter.style),
+                (DialectType::MySQL, ParameterStyle::Question)
+                | (DialectType::PostgreSQL, ParameterStyle::Dollar)
+                | (DialectType::TSQL, ParameterStyle::At)
+                | (DialectType::BigQuery, ParameterStyle::At)
+                | (DialectType::Snowflake, ParameterStyle::Question)
+                | (DialectType::Databricks, ParameterStyle::Colon));
+            if !supported { return json!({"error": "unsupported parameter style"}); }
+        }
+        let value = expression_to_value(node);
+        let kind = node_kind(&value).unwrap_or_default();
+        if !allowed.contains(kind.as_str()) {
+            return json!({"error": format!("unsupported read node: {kind}")});
+        }
+        if has_nonempty_comments(&value) {
+            return json!({"error": "comments and hints are unsupported"});
+        }
+        if contains_unquoted_variable(&value) {
+            return json!({"error": "session and user variables are unsupported"});
+        }
+        if contains_forbidden_read_property(&value) {
+            return json!({"error": "unsupported read property"});
+        }
+        if function_kinds.contains(kind.as_str()) {
+            let name = value.get(&kind).and_then(Value::as_object).and_then(|v| v.get("name")).and_then(Value::as_str).unwrap_or(&kind);
+            functions.insert(name.to_ascii_lowercase());
+        }
+    }
+    let ast = expression_to_value(root);
+    let mut tables: Vec<String> = collect_real_tables(&ast).iter().map(get_table_name_obj).filter(|v| !v.is_empty()).collect();
+    tables.sort(); tables.dedup();
+    json!({"tables": tables, "functions": functions, "nodes": root.count(|_| true), "depth": root.tree_depth(), "error": ""})
+}
+
+fn has_nonempty_comments(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| (key.ends_with("comments") && value.as_array().is_some_and(|v| !v.is_empty())) || has_nonempty_comments(value)),
+        Value::Array(values) => values.iter().any(has_nonempty_comments),
+        _ => false,
+    }
+}
+
+fn contains_unquoted_variable(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let unsafe_name = object.get("name").and_then(Value::as_str).is_some_and(|name| name.starts_with('@'))
+                && !object.get("quoted").and_then(Value::as_bool).unwrap_or(false);
+            unsafe_name || object.values().any(contains_unquoted_variable)
+        }
+        Value::Array(values) => values.iter().any(contains_unquoted_variable),
+        _ => false,
+    }
+}
+
+fn contains_forbidden_read_property(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(key, value)| {
+            let forbidden = matches!(key.as_str(), "into" | "locks" | "hint" | "hints" | "connect" | "sample" | "lateral_views" | "when" | "final_");
+            let present = match value { Value::Null => false, Value::Bool(v) => *v, Value::Array(v) => !v.is_empty(), Value::String(v) => !v.is_empty(), Value::Object(v) => !v.is_empty(), Value::Number(_) => true };
+            forbidden && present || contains_forbidden_read_property(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_forbidden_read_property),
+        _ => false,
+    }
 }
 
 fn make_limit_node(limit: usize, dialect: DialectType) -> Value {

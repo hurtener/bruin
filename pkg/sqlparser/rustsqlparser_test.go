@@ -48,6 +48,32 @@ func TestRustSQLParserSmoke(t *testing.T) {
 	require.Equal(t, []string{"raw.my_cte"}, tables)
 }
 
+func TestRustSQLParserInspectRead(t *testing.T) {
+	parser, err := NewRustSQLParserWithConfig(false, 32768)
+	require.NoError(t, err)
+	require.NoError(t, parser.Start())
+
+	inspection, err := parser.InspectRead("WITH recent AS (SELECT id, amount FROM analytics.facts WHERE id = ?) SELECT id, SUM(amount) FROM recent GROUP BY id", "mysql", 256, 32)
+	require.NoError(t, err)
+	require.Equal(t, []string{"analytics.facts"}, inspection.Tables)
+	require.Contains(t, inspection.Functions, "sum")
+	require.Positive(t, inspection.Nodes)
+
+	for _, statement := range []string{
+		"SELECT 1; SELECT 2",
+		"SELECT 1 INTO OUTFILE '/tmp/result'",
+		"SELECT @secret",
+		"SELECT * FROM analytics.facts FOR UPDATE",
+		"SELECT /*!50000 SLEEP(10) */ 1",
+		"SELECT /*+ MAX_EXECUTION_TIME(1) */ 1",
+	} {
+		_, err := parser.InspectRead(statement, "mysql", 256, 32)
+		require.Error(t, err, statement)
+	}
+	_, err = parser.InspectRead("SELECT id FROM analytics.facts", "mysql", 1, 32)
+	require.Error(t, err)
+}
+
 func TestRustSQLParser_HoistDeclares(t *testing.T) {
 	t.Parallel()
 

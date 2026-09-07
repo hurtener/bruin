@@ -13,6 +13,39 @@ type RustSQLParser struct {
 	MaxQueryLength int
 }
 
+type ReadInspection struct {
+	Tables    []string `json:"tables"`
+	Functions []string `json:"functions"`
+	Nodes     int      `json:"nodes"`
+	Depth     int      `json:"depth"`
+}
+
+// InspectRead accepts a deliberately narrow, fully traversed query-expression
+// subset and returns dependencies for the embedding application's authority
+// checks. It is structural evidence, never authorization by itself.
+func (s *RustSQLParser) InspectRead(sql, dialect string, maxNodes, maxDepth int) (ReadInspection, error) {
+	if len(sql) > s.MaxQueryLength || maxNodes < 1 || maxDepth < 1 {
+		return ReadInspection{}, errors.New("invalid read syntax bounds")
+	}
+	payload, err := rustFFIInspectRead(sql, dialect, maxNodes, maxDepth)
+	if err != nil {
+		return ReadInspection{}, errors.Wrap(err, "failed to inspect read")
+	}
+	var response struct {
+		ReadInspection
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(payload), &response); err != nil {
+		return ReadInspection{}, errors.Wrap(err, "failed to decode read inspection")
+	}
+	if response.Error != "" {
+		return ReadInspection{}, errors.New(response.Error)
+	}
+	sort.Strings(response.Tables)
+	sort.Strings(response.Functions)
+	return response.ReadInspection, nil
+}
+
 func NewRustSQLParser(_ bool) (*RustSQLParser, error) {
 	return NewRustSQLParserWithConfig(false, 10000)
 }

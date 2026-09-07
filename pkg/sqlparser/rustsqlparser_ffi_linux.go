@@ -12,6 +12,7 @@ char* bruin_rustsqlparser_get_tables(const char* query, const char* dialect);
 char* bruin_rustsqlparser_rename_tables(const char* query, const char* dialect, const char* table_mapping_json);
 char* bruin_rustsqlparser_add_limit(const char* query, int64_t limit, const char* dialect);
 char* bruin_rustsqlparser_is_single_select(const char* query, const char* dialect);
+char* bruin_rustsqlparser_inspect_read(const char* query, const char* dialect, int64_t max_nodes, int64_t max_depth);
 char* bruin_rustsqlparser_column_lineage(const char* query, const char* dialect, const char* schema_json);
 char* bruin_rustsqlparser_hoist_declares(const char* query, const char* dialect);
 char* bruin_rustsqlparser_hoist_declares_list(const char* queries_json, const char* dialect);
@@ -69,6 +70,14 @@ func rustFFIIsSingleSelect(query, dialect string) (string, error) {
 	defer C.free(unsafe.Pointer(cQuery))
 	defer C.free(unsafe.Pointer(cDialect))
 	return ffiCall(C.bruin_rustsqlparser_is_single_select(cQuery, cDialect))
+}
+
+func rustFFIInspectRead(query, dialect string, maxNodes, maxDepth int) (string, error) {
+	cQuery := C.CString(query)
+	cDialect := C.CString(dialect)
+	defer C.free(unsafe.Pointer(cQuery))
+	defer C.free(unsafe.Pointer(cDialect))
+	return ffiCall(C.bruin_rustsqlparser_inspect_read(cQuery, cDialect, C.int64_t(maxNodes), C.int64_t(maxDepth)))
 }
 
 func rustFFIColumnLineage(query, dialect, schemaJSON string) (string, error) {

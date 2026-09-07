@@ -121,6 +121,15 @@ pub extern "C" fn bruin_rustsqlparser_is_single_select(
 }
 
 #[no_mangle]
+pub extern "C" fn bruin_rustsqlparser_inspect_read(query: *const c_char, dialect: *const c_char, max_nodes: i64, max_depth: i64) -> *mut c_char {
+    ffi_call(|| {
+        if max_nodes < 1 || max_depth < 1 { return Err("invalid read syntax bounds".into()); }
+        let result = compat::inspect_read(read_cstr(query)?, read_dialect(dialect)?, max_nodes as usize, max_depth as usize);
+        serde_json::to_string(&result).map_err(|e| e.to_string())
+    })
+}
+
+#[no_mangle]
 pub extern "C" fn bruin_rustsqlparser_column_lineage(
     query: *const c_char,
     dialect: *const c_char,

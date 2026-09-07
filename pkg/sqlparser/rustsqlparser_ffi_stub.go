@@ -24,6 +24,10 @@ func rustFFIIsSingleSelect(query, dialect string) (string, error) {
 	return "", ensureRustSQLParserFFI()
 }
 
+func rustFFIInspectRead(query, dialect string, maxNodes, maxDepth int) (string, error) {
+	return "", ensureRustSQLParserFFI()
+}
+
 func rustFFIColumnLineage(query, dialect, schemaJSON string) (string, error) {
 	return "", ensureRustSQLParserFFI()
 }
