@@ -30,6 +30,7 @@ func TestOpenReadMySQLIntegration(t *testing.T) {
 	}
 	client, err := NewClient(testConfig(dsn))
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
 	observer := &recordingObserver{}
 	stream, _, err := client.OpenRead(t.Context(), &query.Query{Query: "SELECT CAST('9007199254740993.125' AS DECIMAL(30,3)) AS amount, CAST(? AS SIGNED) AS bound_value, CAST(X'00FF' AS BINARY(2)) AS payload", Args: []any{int64(9007199254740993)}}, "exact-types-1", observer, ReadOptions{})
 	require.NoError(t, err)
@@ -45,7 +46,7 @@ func TestOpenReadMySQLIntegration(t *testing.T) {
 	cancelObserver := observerFunc{dispatch: func(_ context.Context, identity ReadIdentity) error { dispatched <- identity; return nil }}
 	result := make(chan error, 1)
 	go func() {
-		stream, _, err := client.OpenRead(context.Background(), &query.Query{Query: "SELECT SLEEP(5)"}, "cancel-1", cancelObserver, ReadOptions{})
+		stream, _, err := client.OpenRead(context.Background(), &query.Query{Query: "SELECT SLEEP(5) /* bruin_cancel_probe */"}, "cancel-1", cancelObserver, ReadOptions{})
 		if err == nil {
 			for stream.Next() {
 				_, err = stream.Values()
@@ -63,13 +64,39 @@ func TestOpenReadMySQLIntegration(t *testing.T) {
 	identity := <-dispatched
 	started := time.Now()
 	time.Sleep(100 * time.Millisecond)
-	require.NoError(t, client.CancelRead(t.Context(), identity, ReadOptions{}))
+	restartedClient, err := NewClient(testConfig(dsn))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, restartedClient.Close()) })
+	state, err := restartedClient.ReadStatus(t.Context(), identity, ReadOptions{})
+	require.NoError(t, err)
+	require.Equal(t, ReadStateRunning, state)
+
+	wrongTag := identity
+	wrongTag.AttemptTag = "cancel-other"
+	state, err = restartedClient.ReadStatus(t.Context(), wrongTag, ReadOptions{})
+	require.NoError(t, err)
+	require.Equal(t, ReadStateIndeterminate, state)
+	wrongAccount := identity
+	wrongAccount.Account = "other@%"
+	state, err = restartedClient.ReadStatus(t.Context(), wrongAccount, ReadOptions{})
+	require.NoError(t, err)
+	require.Equal(t, ReadStateIndeterminate, state)
+	wrongDatabase := identity
+	wrongDatabase.Database = "other"
+	state, err = restartedClient.ReadStatus(t.Context(), wrongDatabase, ReadOptions{})
+	require.NoError(t, err)
+	require.Equal(t, ReadStateIndeterminate, state)
+
+	require.NoError(t, restartedClient.CancelRead(t.Context(), identity, ReadOptions{}))
 	select {
 	case <-result:
 		require.Less(t, time.Since(started), 2*time.Second)
 	case <-time.After(2 * time.Second):
 		t.Fatal("cancelled MySQL query did not return promptly")
 	}
+	var remaining int
+	require.NoError(t, restartedClient.control.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM information_schema.processlist WHERE ID = ? AND INFO LIKE '%bruin_cancel_probe%'", identity.ConnectionID).Scan(&remaining))
+	require.Zero(t, remaining, "cancelled query is still executing on the server")
 }
 
 type observerFunc struct {

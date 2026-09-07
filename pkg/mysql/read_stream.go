@@ -49,6 +49,9 @@ type ReadObserver interface {
 type ReadOptions struct {
 	// RequireTLS rejects a native DSN that has no explicit TLS mode. Named TLS
 	// configurations must already be registered with go-sql-driver/mysql.
+	// Restart reconciliation additionally requires SELECT on only
+	// performance_schema.threads and performance_schema.user_variables_by_thread;
+	// without both, ReadStatus returns indeterminate with the native error.
 	RequireTLS bool
 }
 
