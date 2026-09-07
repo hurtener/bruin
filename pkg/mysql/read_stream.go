@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"sync"
+	"time"
 
 	"github.com/bruin-data/bruin/pkg/query"
 	mysqldriver "github.com/go-sql-driver/mysql"
@@ -18,6 +19,20 @@ var (
 	ErrReadIdentity  = errors.New("mysql read identity is invalid")
 	readTagPattern   = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 )
+
+// ReadFailure preserves an operation error and separately reports acknowledged
+// rollback of the original owned transaction. It never infers stop from closing
+// or losing the connection alone.
+type ReadFailure struct {
+	Cause   error
+	Stopped bool
+}
+
+func (e *ReadFailure) Error() string { return e.Cause.Error() }
+func (e *ReadFailure) Unwrap() error { return e.Cause }
+func (e *ReadFailure) ReadStopped() bool {
+	return e.Stopped
+}
 
 type ReadState string
 
@@ -57,7 +72,8 @@ type ReadOptions struct {
 	RequireTLS bool
 	// MaxRows applies MySQL's native per-session select ceiling before user SQL.
 	// Zero uses the connector's conservative default.
-	MaxRows int
+	MaxRows       int
+	CancelTimeout time.Duration
 }
 
 // ReadSession is the reserved read-only transaction used to establish native
@@ -201,24 +217,42 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 		return nil, ReadIdentity{}, fmt.Errorf("failed to reserve mysql connection: %w", err)
 	}
 	fail := func(err error) (*ReadStream, ReadIdentity, error) { _ = conn.Close(); return nil, ReadIdentity{}, err }
-	tx, err := conn.BeginTxx(ctx, &sql.TxOptions{ReadOnly: true})
+	// Query operations retain the caller's context. The transaction lifetime is
+	// detached so context cancellation cannot race an explicit rollback and hide
+	// whether the original owned transaction acknowledged cleanup.
+	transactionContext, stopTransaction := readTransactionContext(ctx, options.CancelTimeout)
+	stopBeginBridge := context.AfterFunc(ctx, stopTransaction)
+	tx, err := conn.BeginTxx(transactionContext, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
+		stopBeginBridge()
+		stopTransaction()
+		if contextErr := ctx.Err(); contextErr != nil {
+			err = contextErr
+		}
 		return fail(fmt.Errorf("failed to begin mysql read-only transaction: %w", err))
+	}
+	if !stopBeginBridge() {
+		_ = tx.Rollback()
+		stopTransaction()
+		return fail(ctx.Err())
 	}
 	// sql_select_limit is a session variable and survives rollback when a pooled
 	// connection is reused. Restore the verifier ceiling before any metadata read;
 	// the caller's result ceiling is installed only after verification below.
 	if _, err := tx.ExecContext(ctx, "SET SESSION sql_select_limit = 100001"); err != nil {
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(fmt.Errorf("failed to reset mysql verifier row bound: %w", err))
 	}
 	var identity ReadIdentity
 	if _, err := tx.ExecContext(ctx, "SET @bruin_read_attempt = ?", attemptTag); err != nil {
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(fmt.Errorf("failed to tag mysql read session: %w", err))
 	}
 	if err := tx.QueryRowContext(ctx, "SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), ''), @@server_uuid").Scan(&identity.ConnectionID, &identity.Account, &identity.Database, &identity.ServerUUID); err != nil {
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(fmt.Errorf("failed to identify mysql read session: %w", err))
 	}
 	identity.AttemptTag = attemptTag
@@ -229,6 +263,7 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 	if _, exists := c.activeReads[attemptTag]; exists {
 		c.readMutex.Unlock()
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(errors.New("mysql read attempt tag is already active"))
 	}
 	c.activeReads[attemptTag] = &activeRead{identity: identity, state: ReadStateRunning}
@@ -237,6 +272,7 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 		if err := verify(ctx, readSession{tx: tx}); err != nil {
 			c.removeActiveRead(identity)
 			_ = tx.Rollback()
+			stopTransaction()
 			return fail(fmt.Errorf("mysql read verification failed: %w", err))
 		}
 	}
@@ -247,41 +283,76 @@ func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, at
 	if maximumRows < 1 || maximumRows > 100001 {
 		c.removeActiveRead(identity)
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(errors.New("mysql governed read row bound is invalid"))
 	}
 	if _, err := tx.ExecContext(ctx, "SET SESSION sql_select_limit = ?", maximumRows); err != nil {
 		c.removeActiveRead(identity)
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(fmt.Errorf("failed to set mysql result row bound: %w", err))
 	}
 	if err := observer.OnDispatch(ctx, identity); err != nil {
 		c.removeActiveRead(identity)
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(fmt.Errorf("mysql read dispatch was not accepted: %w", err))
 	}
-	rows, err := tx.QueryContext(ctx, queryObj.String(), queryObj.Args...)
+	queryContext, stopQuery := context.WithCancel(context.WithoutCancel(ctx))
+	stopQueryBridge := context.AfterFunc(ctx, stopQuery)
+	rows, err := tx.QueryContext(queryContext, queryObj.String(), queryObj.Args...)
 	if err != nil {
+		stopQueryBridge()
+		stopQuery()
 		c.removeActiveRead(identity)
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(fmt.Errorf("failed to execute mysql read: %w", err))
+	}
+	if !stopQueryBridge() {
+		rowsErr := rows.Close()
+		stopQuery()
+		rollbackErr := tx.Rollback()
+		stopTransaction()
+		connectionErr := conn.Close()
+		c.removeActiveRead(identity)
+		return nil, identity, readFailure(ctx.Err(), readCleanupFailure(rowsErr, rollbackErr, connectionErr))
 	}
 	columnTypes, err := rows.ColumnTypes()
 	if err != nil {
 		_ = rows.Close()
+		stopQuery()
 		c.removeActiveRead(identity)
 		_ = tx.Rollback()
+		stopTransaction()
 		return fail(fmt.Errorf("failed to retrieve mysql result schema: %w", err))
 	}
+	stream := &ReadStream{columns: query.ColumnsFromSQL(columnTypes), rows: rows, tx: tx, conn: conn, client: c, identity: identity, stopQuery: stopQuery, stopTransaction: stopTransaction, cancelTimeout: readCancelTimeout(options.CancelTimeout)}
+	stream.stopWatcher = context.AfterFunc(ctx, func() { _ = stream.finish() })
 	if err := observer.OnAcknowledged(ctx, identity); err != nil {
-		_ = rows.Close()
-		c.removeActiveRead(identity)
-		_ = tx.Rollback()
-		return fail(fmt.Errorf("mysql read acknowledgement was not accepted: %w", err))
+		cleanupErr := stream.Close()
+		return nil, identity, readFailure(fmt.Errorf("mysql read acknowledgement was not accepted: %w", err), cleanupErr)
 	}
-	return &ReadStream{columns: query.ColumnsFromSQL(columnTypes), rows: rows, tx: tx, conn: conn, client: c, identity: identity}, identity, nil
+	return stream, identity, nil
 }
 
 type readSession struct{ tx *sqlx.Tx }
+
+func readTransactionContext(ctx context.Context, cancelTimeout time.Duration) (context.Context, context.CancelFunc) {
+	cancelTimeout = readCancelTimeout(cancelTimeout)
+	base := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(base, deadline.Add(cancelTimeout))
+	}
+	return context.WithCancel(base)
+}
+
+func readCancelTimeout(cancelTimeout time.Duration) time.Duration {
+	if cancelTimeout < time.Millisecond || cancelTimeout > 30*time.Second {
+		return time.Second
+	}
+	return cancelTimeout
+}
 
 func (s readSession) Query(ctx context.Context, q *query.Query) (query.RowStream, error) {
 	if q == nil {
@@ -382,14 +453,18 @@ func (c *Client) removeActiveRead(identity ReadIdentity) {
 }
 
 type ReadStream struct {
-	columns  []query.Column
-	rows     *sql.Rows
-	tx       *sqlx.Tx
-	conn     *sqlx.Conn
-	client   *Client
-	identity ReadIdentity
-	close    sync.Once
-	closeErr error
+	columns         []query.Column
+	rows            *sql.Rows
+	tx              *sqlx.Tx
+	conn            *sqlx.Conn
+	client          *Client
+	identity        ReadIdentity
+	stopQuery       context.CancelFunc
+	stopTransaction context.CancelFunc
+	stopWatcher     func() bool
+	cancelTimeout   time.Duration
+	close           sync.Once
+	closeErr        error
 }
 
 func (s *ReadStream) Columns() []query.Column { return append([]query.Column(nil), s.columns...) }
@@ -419,15 +494,45 @@ func (s *ReadStream) Err() error {
 }
 
 func (s *ReadStream) Close() error {
+	if s.stopWatcher != nil {
+		s.stopWatcher()
+	}
+	return s.finish()
+}
+
+func (s *ReadStream) finish() error {
 	s.close.Do(func() {
-		rowsErr := s.rows.Close()
-		txErr := s.tx.Rollback()
-		connErr := s.conn.Close()
+		s.closeErr = finishRead(s.cancelTimeout, s.stopQuery, s.stopTransaction, s.rows.Close, s.tx.Rollback, s.conn.Close)
 		s.client.removeActiveRead(s.identity)
-		if errors.Is(txErr, sql.ErrTxDone) {
-			txErr = nil
-		}
-		s.closeErr = errors.Join(rowsErr, txErr, connErr)
 	})
 	return s.closeErr
+}
+
+func finishRead(cancelTimeout time.Duration, stopQuery, stopTransaction func(), closeRows, rollback, closeConnection func() error) error {
+	stopSlowDrain := time.AfterFunc(readCancelTimeout(cancelTimeout), stopQuery)
+	rowsErr := closeRows()
+	rollbackErr := rollback()
+	stopSlowDrain.Stop()
+	stopQuery()
+	stopTransaction()
+	connectionErr := closeConnection()
+	return readCleanupFailure(rowsErr, rollbackErr, connectionErr)
+}
+
+func readCleanupFailure(rowsErr, rollbackErr, connectionErr error) error {
+	stopped := rollbackErr == nil
+	cause := errors.Join(rowsErr, rollbackErr, connectionErr)
+	if cause == nil {
+		return nil
+	}
+	return &ReadFailure{Cause: cause, Stopped: stopped}
+}
+
+func readFailure(cause, cleanupErr error) error {
+	stopped := cleanupErr == nil
+	var receipt *ReadFailure
+	if errors.As(cleanupErr, &receipt) {
+		stopped = receipt.Stopped
+	}
+	return &ReadFailure{Cause: errors.Join(cause, cleanupErr), Stopped: stopped}
 }

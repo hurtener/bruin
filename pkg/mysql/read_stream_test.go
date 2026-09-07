@@ -2,7 +2,10 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,13 +103,19 @@ func TestOpenReadMySQLIntegration(t *testing.T) {
 }
 
 type observerFunc struct {
-	dispatch func(context.Context, ReadIdentity) error
+	dispatch     func(context.Context, ReadIdentity) error
+	acknowledged func(context.Context, ReadIdentity) error
 }
 
 func (o observerFunc) OnDispatch(ctx context.Context, identity ReadIdentity) error {
 	return o.dispatch(ctx, identity)
 }
-func (o observerFunc) OnAcknowledged(context.Context, ReadIdentity) error { return nil }
+func (o observerFunc) OnAcknowledged(ctx context.Context, identity ReadIdentity) error {
+	if o.acknowledged != nil {
+		return o.acknowledged(ctx, identity)
+	}
+	return nil
+}
 
 func (o *recordingObserver) OnDispatch(_ context.Context, identity ReadIdentity) error {
 	o.dispatched = identity.ConnectionID == 42 && identity.AttemptTag == "attempt-1"
@@ -213,4 +222,104 @@ func TestCancelReadRejectsChangedServerIdentity(t *testing.T) {
 	err = client.CancelRead(t.Context(), ReadIdentity{ConnectionID: 42, AttemptTag: "attempt-1", Account: "reader@%", Database: "warehouse", ServerUUID: "old-server"}, ReadOptions{})
 	require.ErrorIs(t, err, ErrReadNotActive)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestReadCleanupFailurePreservesRollbackEvidence(t *testing.T) {
+	t.Parallel()
+	requestErr := context.Canceled
+	rollbackErr := errors.New("synthetic rollback failure")
+	for _, test := range []struct {
+		name     string
+		rollback error
+		stopped  bool
+	}{
+		{name: "acknowledged rollback", stopped: true},
+		{name: "unobserved concurrent rollback", rollback: sql.ErrTxDone},
+		{name: "unresolved rollback", rollback: rollbackErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			err := readCleanupFailure(requestErr, test.rollback, nil)
+			var failure *ReadFailure
+			require.ErrorAs(t, err, &failure)
+			require.ErrorIs(t, err, requestErr)
+			require.Equal(t, test.stopped, failure.Stopped)
+			require.Equal(t, test.stopped, failure.ReadStopped())
+			if test.rollback != nil && test.rollback != sql.ErrTxDone {
+				require.ErrorIs(t, err, test.rollback)
+			}
+		})
+	}
+}
+
+func TestAcknowledgedCancellationReturnsExplicitRollbackReceipt(t *testing.T) {
+	t.Parallel()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	mock.ExpectBegin()
+	mock.ExpectExec("SET SESSION sql_select_limit = 100001").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec("SET @bruin_read_attempt = ?").WithArgs("attempt-1").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), ''), @@server_uuid").WillReturnRows(sqlmock.NewRows([]string{"id", "account", "database", "server_uuid"}).AddRow(42, "reader@%", "warehouse", "server-uuid"))
+	mock.ExpectExec("SET SESSION sql_select_limit = ?").WithArgs(100001).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT amount FROM facts").WillReturnRows(sqlmock.NewRows([]string{"amount"}).AddRow(1).CloseError(context.Canceled)).RowsWillBeClosed()
+	mock.ExpectRollback()
+
+	client := &Client{readConn: sqlx.NewDb(db, "sqlmock"), control: sqlx.NewDb(db, "sqlmock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	observer := observerFunc{
+		dispatch: func(context.Context, ReadIdentity) error { return nil },
+		acknowledged: func(context.Context, ReadIdentity) error {
+			cancel()
+			return nil
+		},
+	}
+	stream, _, err := client.OpenRead(ctx, &query.Query{Query: "SELECT amount FROM facts"}, "attempt-1", observer, ReadOptions{})
+	require.NoError(t, err)
+	closeErr := stream.Close()
+	var failure *ReadFailure
+	require.ErrorAs(t, closeErr, &failure)
+	require.ErrorIs(t, closeErr, context.Canceled)
+	require.True(t, failure.Stopped)
+	require.True(t, failure.ReadStopped())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOpenReadCancellationStillBoundsTransactionBegin(t *testing.T) {
+	t.Parallel()
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	mock.ExpectBegin().WillDelayFor(time.Second)
+	client := &Client{readConn: sqlx.NewDb(db, "sqlmock"), control: sqlx.NewDb(db, "sqlmock")}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, err = client.OpenRead(ctx, &query.Query{Query: "SELECT 1"}, "attempt-1", &recordingObserver{}, ReadOptions{CancelTimeout: time.Second})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Less(t, time.Since(started), 500*time.Millisecond)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSlowResultCleanupIsBoundedAndRemainsUncertain(t *testing.T) {
+	t.Parallel()
+	unblock := make(chan struct{})
+	stopOnce := sync.Once{}
+	stopQuery := func() { stopOnce.Do(func() { close(unblock) }) }
+	rollbackErr := errors.New("synthetic rollback was not acknowledged")
+	started := time.Now()
+	err := finishRead(10*time.Millisecond, stopQuery, func() {}, func() error {
+		<-unblock
+		return context.Canceled
+	}, func() error {
+		return rollbackErr
+	}, func() error {
+		return nil
+	})
+	var failure *ReadFailure
+	require.ErrorAs(t, err, &failure)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, rollbackErr)
+	require.False(t, failure.Stopped)
+	require.Less(t, time.Since(started), 500*time.Millisecond)
 }
