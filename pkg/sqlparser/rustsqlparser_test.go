@@ -74,6 +74,27 @@ func TestRustSQLParserInspectRead(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestRustSQLParserInspectReadDialects(t *testing.T) {
+	parser, err := NewRustSQLParserWithConfig(false, 32768)
+	require.NoError(t, err)
+	tests := []struct{ dialect, sql, table string }{
+		{"mysql", "SELECT id FROM warehouse.facts WHERE id = ?", "warehouse.facts"},
+		{"tsql", "SELECT id FROM dbo.facts WHERE id = @p1", "dbo.facts"},
+		{"bigquery", "SELECT id FROM project.dataset.facts WHERE id = @id", "project.dataset.facts"},
+		{"snowflake", "SELECT id FROM database.schema.facts WHERE id = ?", "database.schema.facts"},
+		{"databricks", "SELECT id FROM catalog.schema.facts WHERE id = :id", "catalog.schema.facts"},
+	}
+	for _, test := range tests {
+		t.Run(test.dialect, func(t *testing.T) {
+			inspection, err := parser.InspectRead(test.sql, test.dialect, 128, 24)
+			require.NoError(t, err)
+			require.Equal(t, []string{test.table}, inspection.Tables)
+			_, err = parser.InspectRead(test.sql+" trailing", test.dialect, 128, 24)
+			require.Error(t, err, "parser must consume the complete input")
+		})
+	}
+}
+
 func TestRustSQLParser_HoistDeclares(t *testing.T) {
 	t.Parallel()
 

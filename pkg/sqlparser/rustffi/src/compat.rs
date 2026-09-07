@@ -2046,7 +2046,7 @@ pub fn inspect_read(query: &str, dialect: DialectType, max_nodes: usize, max_dep
         if has_nonempty_comments(&value) {
             return json!({"error": "comments and hints are unsupported"});
         }
-        if contains_unquoted_variable(&value) {
+        if dialect == DialectType::MySQL && !matches!(node, Expression::Parameter(_)) && contains_unquoted_variable(&value) {
             return json!({"error": "session and user variables are unsupported"});
         }
         if contains_forbidden_read_property(&value) {
