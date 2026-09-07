@@ -149,6 +149,37 @@ func TestOpenReadBindsArgumentsAndExposesEmptySchema(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestOpenReadVerifiedUsesSameTransactionBeforeDispatch(t *testing.T) {
+	t.Parallel()
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	mock.ExpectBegin()
+	mock.ExpectExec("SET @bruin_read_attempt = ?").WithArgs("attempt-1").WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectQuery("SELECT CONNECTION_ID(), CURRENT_USER(), COALESCE(DATABASE(), ''), @@server_uuid").WillReturnRows(sqlmock.NewRows([]string{"id", "account", "database", "server_uuid"}).AddRow(42, "reader@%", "warehouse", "server-uuid"))
+	mock.ExpectQuery("SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = ?").WithArgs("warehouse").WillReturnRows(sqlmock.NewRows([]string{"TABLE_NAME"}).AddRow("facts"))
+	mock.ExpectQuery("SELECT amount FROM facts").WillReturnRows(sqlmock.NewRows([]string{"amount"}))
+	mock.ExpectRollback()
+
+	client := &Client{readConn: sqlx.NewDb(db, "sqlmock"), control: sqlx.NewDb(db, "sqlmock")}
+	observer := &recordingObserver{}
+	verify := func(ctx context.Context, session ReadSession) error {
+		rows, err := session.Query(ctx, &query.Query{Query: "SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_SCHEMA = ?", Args: []any{"warehouse"}})
+		require.NoError(t, err)
+		defer rows.Close()
+		require.True(t, rows.Next())
+		values, err := rows.Values()
+		require.NoError(t, err)
+		require.Equal(t, "facts", values[0])
+		return rows.Err()
+	}
+	stream, _, err := client.OpenReadVerified(t.Context(), &query.Query{Query: "SELECT amount FROM facts"}, "attempt-1", observer, ReadOptions{}, verify)
+	require.NoError(t, err)
+	require.True(t, observer.acknowledged)
+	require.NoError(t, stream.Close())
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestOpenReadRejectsMissingTLSBeforeConnecting(t *testing.T) {
 	t.Parallel()
 	client, err := NewClient(Config{Username: "reader", Password: "secret", Host: "127.0.0.1", Database: "warehouse"})

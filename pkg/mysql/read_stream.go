@@ -57,6 +57,16 @@ type ReadOptions struct {
 	RequireTLS bool
 }
 
+// ReadSession is the reserved read-only transaction used to establish native
+// catalog and credential evidence immediately before dispatch. A verifier may
+// issue bounded metadata reads; it cannot commit, mutate client pools, or retain
+// the transaction after OpenReadVerified returns.
+type ReadSession interface {
+	Query(context.Context, *query.Query) (query.RowStream, error)
+}
+
+type ReadVerifier func(context.Context, ReadSession) error
+
 type activeRead struct {
 	identity ReadIdentity
 	state    ReadState
@@ -164,6 +174,13 @@ func readStatusOnAfterServerProof(ctx context.Context, control *sqlx.Conn, ident
 // OpenRead reserves one read-only session, publishes its identity, and only
 // then dispatches the caller's typed query and arguments.
 func (c *Client) OpenRead(ctx context.Context, queryObj *query.Query, attemptTag string, observer ReadObserver, options ReadOptions) (*ReadStream, ReadIdentity, error) {
+	return c.OpenReadVerified(ctx, queryObj, attemptTag, observer, options, nil)
+}
+
+// OpenReadVerified keeps native catalog verification and user SQL on the same
+// read-only transaction. The observer still sees no dispatch until verification
+// succeeds and receives the native identity before user SQL is issued.
+func (c *Client) OpenReadVerified(ctx context.Context, queryObj *query.Query, attemptTag string, observer ReadObserver, options ReadOptions, verify ReadVerifier) (*ReadStream, ReadIdentity, error) {
 	if queryObj == nil || observer == nil {
 		return nil, ReadIdentity{}, errors.New("query and read observer are required")
 	}
@@ -203,6 +220,13 @@ func (c *Client) OpenRead(ctx context.Context, queryObj *query.Query, attemptTag
 	}
 	c.activeReads[attemptTag] = &activeRead{identity: identity, state: ReadStateRunning}
 	c.readMutex.Unlock()
+	if verify != nil {
+		if err := verify(ctx, readSession{tx: tx}); err != nil {
+			c.removeActiveRead(identity)
+			_ = tx.Rollback()
+			return fail(fmt.Errorf("mysql read verification failed: %w", err))
+		}
+	}
 	if err := observer.OnDispatch(ctx, identity); err != nil {
 		c.removeActiveRead(identity)
 		_ = tx.Rollback()
@@ -229,6 +253,50 @@ func (c *Client) OpenRead(ctx context.Context, queryObj *query.Query, attemptTag
 	}
 	return &ReadStream{columns: query.ColumnsFromSQL(columnTypes), rows: rows, tx: tx, conn: conn, client: c, identity: identity}, identity, nil
 }
+
+type readSession struct{ tx *sqlx.Tx }
+
+func (s readSession) Query(ctx context.Context, q *query.Query) (query.RowStream, error) {
+	if q == nil {
+		return nil, errors.New("mysql verification query is required")
+	}
+	rows, err := s.tx.QueryContext(ctx, q.String(), q.Args...)
+	if err != nil {
+		return nil, err
+	}
+	types, err := rows.ColumnTypes()
+	if err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	return &sessionRows{columns: query.ColumnsFromSQL(types), rows: rows}, nil
+}
+
+type sessionRows struct {
+	columns []query.Column
+	rows    *sql.Rows
+}
+
+func (s *sessionRows) Columns() []query.Column { return append([]query.Column(nil), s.columns...) }
+func (s *sessionRows) Next() bool              { return s.rows.Next() }
+func (s *sessionRows) Values() ([]any, error) {
+	values := make([]any, len(s.columns))
+	destinations := make([]any, len(values))
+	for i := range values {
+		destinations[i] = &values[i]
+	}
+	if err := s.rows.Scan(destinations...); err != nil {
+		return nil, err
+	}
+	for i, value := range values {
+		if bytes, ok := value.([]byte); ok {
+			values[i] = append([]byte(nil), bytes...)
+		}
+	}
+	return values, nil
+}
+func (s *sessionRows) Err() error   { return s.rows.Err() }
+func (s *sessionRows) Close() error { return s.rows.Close() }
 
 func (c *Client) initializeReadDB(ctx context.Context, requireTLS bool) error {
 	c.mutex.Lock()
