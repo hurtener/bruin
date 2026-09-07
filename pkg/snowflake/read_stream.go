@@ -230,8 +230,12 @@ func ownedReadValue(value any) any {
 		return append([]byte(nil), value...)
 	case *big.Int:
 		return new(big.Int).Set(value)
+	case big.Int:
+		return *new(big.Int).Set(&value)
 	case *big.Float:
 		return new(big.Float).Copy(value)
+	case big.Float:
+		return *new(big.Float).Copy(&value)
 	default:
 		return value
 	}
