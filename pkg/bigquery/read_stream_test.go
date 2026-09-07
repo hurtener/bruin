@@ -46,6 +46,7 @@ type readProtocolFixture struct {
 	cancelCount   int
 	empty         bool
 	temporal      bool
+	dryRun        bool
 }
 
 func (f *readProtocolFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +61,9 @@ func (f *readProtocolFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			panic(err)
 		}
 		f.job["status"] = map[string]any{"state": f.state}
+		if f.dryRun {
+			f.job["statistics"] = map[string]any{"query": map[string]any{"statementType": "SELECT", "totalBytesProcessed": "512", "referencedTables": []any{map[string]any{"projectId": "synthetic-project", "datasetId": "analytics", "tableId": "sales"}}, "schema": map[string]any{"fields": []any{map[string]any{"name": "amount", "type": "NUMERIC", "precision": "38", "scale": "9"}}}}}
+		}
 		if f.mismatch {
 			f.job["jobReference"].(map[string]any)["location"] = "EU"
 		}
@@ -232,6 +236,23 @@ func TestReadProtocol(t *testing.T) {
 				t.Fatal("foreign identity accepted")
 			}
 		})
+	}
+}
+
+func TestGovernedDryRunProtocol(t *testing.T) {
+	f := &readProtocolFixture{state: "DONE", dryRun: true}
+	c := readFixtureClient(t, f)
+	result, err := c.DryRunRead(context.Background(), &query.Query{Query: "SELECT amount FROM `synthetic-project.analytics.sales` WHERE id=@id", Args: []any{ReadParameter{Name: "id", Type: "INT64", Value: int64(9007199254740993)}}}, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StatementType != "SELECT" || result.TotalBytesProcessed != 512 || len(result.ReferencedTables) != 1 || result.ReferencedTables[0] != "synthetic-project.analytics.sales" || len(result.Columns) != 1 || result.Columns[0].DatabaseType != "NUMERIC" {
+		t.Fatalf("dry-run evidence: %#v", result)
+	}
+	native := f.job["configuration"].(map[string]any)["query"].(map[string]any)
+	params := native["queryParameters"].([]any)
+	if len(params) != 1 || params[0].(map[string]any)["name"] != "id" || params[0].(map[string]any)["parameterValue"].(map[string]any)["value"] != "9007199254740993" || native["maximumBytesBilled"] != "1024" {
+		t.Fatalf("dry-run binding: %#v", native)
 	}
 }
 

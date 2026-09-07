@@ -63,6 +63,16 @@ type ReadParameter struct {
 	Value      any
 }
 
+// ReadDryRun is bounded native planning evidence for one governed read. It is
+// separate from OpenRead because a dry run has no executing job to journal or
+// cancel. ReferencedTables and Columns come from BigQuery's native response.
+type ReadDryRun struct {
+	StatementType       string
+	TotalBytesProcessed int64
+	ReferencedTables    []string
+	Columns             []query.Column
+}
+
 func (i ReadIdentity) valid() bool {
 	return readProjectPattern.MatchString(i.ProjectID) && readLocationPattern.MatchString(i.Location) && readJobPattern.MatchString(i.JobID)
 }
@@ -197,6 +207,54 @@ func (c *Client) OpenRead(ctx context.Context, q *query.Query, attemptTag string
 		return nil, identity, fmt.Errorf("bigquery read acknowledgement was not accepted: %w", err)
 	}
 	return &ReadStream{rows: rows, columns: columns, cancel: cancel}, identity, nil
+}
+
+// DryRunRead binds the same closed scalar parameters as OpenRead and asks
+// BigQuery to plan without executing the query. The native processed-byte limit
+// remains an admission ceiling; callers still verify dependencies and schema.
+func (c *Client) DryRunRead(ctx context.Context, q *query.Query, maxBytes int64) (ReadDryRun, error) {
+	if ctx == nil || q == nil || strings.TrimSpace(q.Query) == "" || len(q.VariableDefinitions) != 0 || maxBytes < 1 {
+		return ReadDryRun{}, ErrReadParameter
+	}
+	parameters, err := readParameters(q.Args)
+	if err != nil {
+		return ReadDryRun{}, err
+	}
+	client, err := c.readClient(ctx)
+	if err != nil {
+		return ReadDryRun{}, err
+	}
+	native := client.Query(q.String())
+	native.DryRun = true
+	native.UseLegacySQL = false
+	native.DisableQueryCache = true
+	native.Location = c.config.Location
+	native.MaxBytesBilled = maxBytes
+	native.Parameters = parameters
+	job, err := native.Run(ctx)
+	if err != nil {
+		return ReadDryRun{}, fmt.Errorf("bigquery governed dry run failed: %w", err)
+	}
+	status := job.LastStatus()
+	if status == nil || status.Err() != nil || status.Statistics == nil {
+		return ReadDryRun{}, ErrReadSchema
+	}
+	stats, ok := status.Statistics.Details.(*bq.QueryStatistics)
+	if !ok || stats == nil || stats.TotalBytesProcessed < 0 || stats.TotalBytesProcessed > maxBytes {
+		return ReadDryRun{}, ErrReadSchema
+	}
+	columns, err := readColumns(stats.Schema)
+	if err != nil {
+		return ReadDryRun{}, err
+	}
+	out := ReadDryRun{StatementType: stats.StatementType, TotalBytesProcessed: stats.TotalBytesProcessed, Columns: columns}
+	for _, table := range stats.ReferencedTables {
+		if table == nil || table.ProjectID == "" || table.DatasetID == "" || table.TableID == "" {
+			return ReadDryRun{}, ErrReadSchema
+		}
+		out.ReferencedTables = append(out.ReferencedTables, table.ProjectID+"."+table.DatasetID+"."+table.TableID)
+	}
+	return out, nil
 }
 
 func (c *Client) ReadStatus(ctx context.Context, identity ReadIdentity) (ReadState, error) {
